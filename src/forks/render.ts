@@ -1,9 +1,10 @@
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { validateDescription } from "./identity.js";
+import { defaultContext, ROLES, type ForkRole } from "./task-prompt.js";
 
 type RenderContext = {
-  args?: { name?: unknown; description?: unknown; effort?: unknown; tier?: unknown; task?: unknown; forkId?: unknown; message?: unknown };
+  args?: { name?: unknown; description?: unknown; effort?: unknown; tier?: unknown; role?: unknown; context?: unknown; task?: unknown; forkId?: unknown; message?: unknown; reason?: unknown };
   state: Record<string, unknown>;
   lastComponent?: unknown;
   isError?: boolean;
@@ -35,9 +36,11 @@ function descriptionText(value: unknown): string {
 
 function createCallText(args: RenderContext["args"], forkId: unknown, theme: any): string {
   const effort = typeof args?.effort === "string" ? args.effort : typeof args?.tier === "string" ? args.tier : "balanced";
+  const role = typeof args?.role === "string" && ROLES.includes(args.role as ForkRole) ? args.role as ForkRole : undefined;
+  const label = role ? `${role}/${typeof args?.effort === "string" ? args.effort : "?"}/${args?.context ?? defaultContext(role)}` : effort;
   const id = typeof forkId === "string" ? forkId : pendingId(args);
   const description = descriptionText(args?.description);
-  return `${theme.fg("toolTitle", theme.bold("create_fork"))} ${theme.fg("muted", `[${effort}]`)} ${theme.fg("accent", id)}${description ? theme.fg("muted", ` · ${description}`) : ""}`;
+  return `${theme.fg("toolTitle", theme.bold("create_fork"))} ${theme.fg("muted", `[${label}]`)} ${theme.fg("accent", id)}${description ? theme.fg("muted", ` · ${description}`) : ""}`;
 }
 
 function forkId(args: RenderContext["args"]): string {
@@ -141,6 +144,30 @@ export function renderSteerForkResult(result: any, { expanded }: { expanded: boo
   if (context.isError) return new Text(theme.fg("error", output || "Fork steering failed."), 0, 0);
   if (!expanded || typeof context.args?.message !== "string") return new Container();
   return section(theme.fg("muted", "─── Message ───"), theme.fg("dim", context.args.message));
+}
+
+function cancelCallText(args: RenderContext["args"], outcome: unknown, theme: any): string {
+  const resolved = outcome === "cancelled" || outcome === "already_completed" ? theme.fg("muted", `: ${outcome}`) : "";
+  return `${theme.fg("toolTitle", theme.bold("cancel_fork"))} ${theme.fg("accent", forkId(args))}${resolved}`;
+}
+
+export function renderCancelForkCall(args: any, theme: any, context: RenderContext) {
+  const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+  context.state.cancelCallComponent = component;
+  component.setText(cancelCallText(args, context.state.cancelOutcome, theme));
+  return component;
+}
+
+export function renderCancelForkResult(result: any, { expanded }: { expanded: boolean }, theme: any, context: RenderContext) {
+  if (context.isError) return new Text(theme.fg("error", textContent(result) || "Fork cancellation failed."), 0, 0);
+  const outcome = result?.details?.outcome;
+  if (outcome === "cancelled" || outcome === "already_completed") {
+    context.state.cancelOutcome = outcome;
+    const callComponent = context.state.cancelCallComponent;
+    if (callComponent instanceof Text) callComponent.setText(cancelCallText(context.args, outcome, theme));
+  }
+  if (!expanded || typeof context.args?.reason !== "string") return new Container();
+  return section(theme.fg("muted", "─── Reason ───"), theme.fg("dim", context.args.reason));
 }
 
 function statusCallText(args: RenderContext["args"], state: unknown, description: unknown, theme: any): string {

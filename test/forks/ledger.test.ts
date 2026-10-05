@@ -16,6 +16,18 @@ function entry(data: unknown) {
   return { type: "custom", customType: "pi-async-fork", data };
 }
 
+test("preserves explicit contracts and treats historical role as unknown, context as inherit", () => {
+  const legacy = project([entry(created)]).get(created.forkId) as any;
+  assert.equal(legacy.role, undefined);
+  assert.equal(legacy.context, "inherit");
+  const current = project([entry({ ...created, role: "verify", context: "isolated" })]).get(created.forkId) as any;
+  assert.equal(current.role, "verify");
+  assert.equal(current.context, "isolated");
+  for (const fields of [{ role: null }, { role: "invalid" }, { context: null }, { context: "invalid" }]) {
+    assert.equal(project([entry({ ...created, ...fields })]).size, 0);
+  }
+});
+
 test("projects active and completed fork history", () => {
   const entries = [entry(created), entry({ type: "fork.destroyed", forkId: created.forkId, agentId: created.agentId, kind: "response", output: "done", cursor: "c1" })];
   const record = project(entries).get(created.forkId);

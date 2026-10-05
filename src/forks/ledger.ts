@@ -1,5 +1,6 @@
 import type { Tier } from "../configuration.js";
 import { validateDescription } from "./identity.js";
+import { CONTEXTS, ROLES, type ForkContext, type ForkRole } from "./task-prompt.js";
 
 export const ENTRY_TYPE = "pi-async-fork";
 export const RESULT_TYPE = "pi-async-fork-result";
@@ -12,6 +13,8 @@ export type Created = {
   stateDir?: string;
   sessionPath: string;
   tier: Tier;
+  role?: ForkRole;
+  context?: ForkContext;
   triggerTurn?: boolean;
   description?: string;
 };
@@ -48,6 +51,8 @@ function isLifecycleRecord(value: unknown): value is LifecycleRecord {
       && (raw.stateDir === undefined || typeof raw.stateDir === "string")
       && typeof raw.sessionPath === "string"
       && (raw.tier === "fast" || raw.tier === "balanced" || raw.tier === "deep")
+      && (raw.role === undefined || ROLES.includes(raw.role as ForkRole))
+      && (raw.context === undefined || CONTEXTS.includes(raw.context as ForkContext))
       && (raw.triggerTurn === undefined || typeof raw.triggerTurn === "boolean")
       && hasValidDescription(raw.description);
   }
@@ -68,7 +73,7 @@ export function project(entries: readonly any[]): Map<string, ManagedFork> {
   for (const entry of entries) {
     const data = customData(entry);
     if (!data) continue;
-    if (data.type === "fork.created") forks.set(data.forkId, data);
+    if (data.type === "fork.created") forks.set(data.forkId, { ...data, context: data.context ?? "inherit" });
     if (data.type === "fork.destroyed") {
       const created = forks.get(data.forkId);
       if (created && created.agentId === data.agentId) forks.set(data.forkId, { ...created, destroyed: data });

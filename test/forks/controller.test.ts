@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -32,6 +32,7 @@ class FakeAgents implements ManagedAgents {
   created = 0;
   stopped = 0;
   createdEnvironment: Record<string, string> | undefined;
+  createdArgs: string[] | undefined;
   collected: Array<{ limit: number | undefined; signal: AbortSignal | undefined }> = [];
   activityCollection: ActivityCollection = { entries: [], stopReason: "idle", outputTruncated: false, incomplete: false };
   collectError: unknown;
@@ -41,6 +42,7 @@ class FakeAgents implements ManagedAgents {
   async create(name: string, _cwd?: string, _agentDir?: string, _piArgs?: string[], env?: Record<string, string>) {
     this.created += 1;
     this.createdEnvironment = env;
+    this.createdArgs = _piArgs;
     return { ...this.agent, name } as Agent;
   }
   async restore() { return this.agent; }
@@ -62,6 +64,55 @@ class FakeAgents implements ManagedAgents {
 function waitForLifecycle() {
   return new Promise((resolve) => setTimeout(resolve, 10));
 }
+
+test("requires explicit valid role and effort and valid context before creation side effects", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-async-fork-options-"));
+  const branch: any[] = invokingBranch();
+  const { pi, ctx } = harness(root, branch);
+  const agents = new FakeAgents();
+  const controller = new Controller(pi, configuration, agents);
+  try {
+    for (const options of [undefined, {}, { role: "execute" }, { effort: "fast" }, { role: "invalid", effort: "fast" }, { role: "execute", effort: "invalid" }, { role: "verify", effort: "fast", context: "invalid" }]) {
+      await assert.rejects(() => (controller.create as any)(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", options), /Fork (role|effort|context)/);
+    }
+    assert.equal(agents.created, 0);
+    assert.equal(branch.some((entry) => entry?.data?.type === "fork.created"), false);
+    await assert.rejects(() => readdir(join(root, "async-forks")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("all role/effort combinations resolve context, persist contracts and select profiles solely by effort", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-async-fork-matrix-"));
+  try {
+    for (const role of ["investigate", "execute", "verify"] as const) {
+      for (const effort of ["fast", "balanced", "deep"] as const) {
+        for (const context of [undefined, "inherit", "isolated"] as const) {
+          const branch = invokingBranch();
+          const { pi, ctx } = harness(root, branch);
+          const agents = new FakeAgents();
+          const controller = new Controller(pi, configuration, agents);
+          await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role, effort, context });
+          const created = branch.find((entry: any) => entry?.data?.type === "fork.created") as any;
+          const effective = context ?? (role === "verify" ? "isolated" : "inherit");
+          assert.equal(created.data.role, role);
+          assert.equal(created.data.tier, effort);
+          assert.equal(created.data.context, effective);
+          assert.equal(Object.hasOwn(created.data, "effort"), false);
+          assert.deepEqual(agents.createdArgs?.slice(2), ["--provider", "p", "--model", effort, "--thinking", configuration.profiles[effort].thinking]);
+          const records = (await readFile(created.data.sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+          const boundary = records.at(-1);
+          assert.equal(boundary.type, effective === "isolated" ? "custom_message" : "message");
+          assert.match(effective === "isolated" ? boundary.content : boundary.message.content[0].text, new RegExp(`Role: ${role}\\.`));
+          await controller.stop();
+        }
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("registers only after task acceptance and finalizes a settled candidate", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-async-fork-controller-"));
@@ -86,7 +137,7 @@ test("registers only after task acceptance and finalizes a settled candidate", a
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     assert.match(forkId, /^research-\d{7}$/);
     const created = branch.find((entry) => entry?.data?.type === "fork.created");
     assert.equal(Object.hasOwn(created.data, "triggerTurn"), false);
@@ -123,7 +174,7 @@ test("rejects an invalid description before creating a child session or fleet ag
   const controller = new Controller(pi, configuration, agents);
   try {
     await assert.rejects(
-      () => controller.create(ctx, "call-1", "research", "Find the answer.", "Only two"),
+      () => controller.create(ctx, "call-1", "research", "Find the answer.", "Only two", { role: "investigate", effort: "balanced" }),
       /Fork description must contain 3 to 6 words/,
     );
     assert.equal(agents.created, 0);
@@ -140,7 +191,7 @@ test("omits terminal wake choice from new records", async () => {
   const { pi, ctx } = harness(root, branch);
   const controller = new Controller(pi, configuration, new FakeAgents());
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     assert.equal(Object.hasOwn(branch.find((entry) => entry?.data?.type === "fork.created")?.data, "triggerTurn"), false);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -155,7 +206,7 @@ test("passes configured child-Pi environment to agent creation", async () => {
   const env = Object.assign(Object.create(null), { PI_OBSERVATIONAL_MEMORY_PASSIVE: "1" });
   const controller = new Controller(pi, { ...configuration, env }, agents);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     assert.deepEqual(agents.createdEnvironment, env);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -169,11 +220,29 @@ test("omits the state directory from a default-state fork record", async () => {
   const agents = new FakeAgents();
   const controller = new Controller(pi, { ...configuration, stateDir: undefined }, agents);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     const created = branch.find((item) => item?.data?.type === "fork.created");
     assert.equal(Object.hasOwn(created.data, "stateDir"), false);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restores historical and V2 forks without selecting new profiles or retrofitting contracts", async () => {
+  for (const metadata of [{}, { role: "verify", context: "isolated" }]) {
+    const created = { type: "fork.created", forkId: "research-0000001", agentId: "agent-1", agentName: "research-0000001", stateDir: "/fleet", sessionPath: "/child", tier: "deep", ...metadata };
+    const branch = [{ type: "custom", customType: "pi-async-fork", data: created }];
+    const before = JSON.stringify(branch);
+    const { pi, ctx } = harness("/work", branch);
+    const agents = new FakeAgents();
+    const controller = new Controller(pi, configuration, agents);
+    await controller.start(ctx);
+    assert.equal(agents.observed, 1);
+    assert.equal(agents.created, 0);
+    assert.equal(agents.createdArgs, undefined);
+    assert.deepEqual(agents.sent, []);
+    assert.equal(JSON.stringify(branch), before);
+    await controller.stop();
   }
 });
 
@@ -212,7 +281,7 @@ test("drains active finalization before a session tree transition", async () => 
   agents.destroyHook = async () => { destroyStarted(); await release; };
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Answer", cursor: "cursor-1" });
     agents.statusUpdate("idle");
     await waitForLifecycle();
@@ -246,7 +315,7 @@ test("does not register a fork when initial task acceptance fails", async () => 
   agents.steer = async () => { throw new Error("rejected"); };
   const controller = new Controller(pi, configuration, agents);
   try {
-    await assert.rejects(() => controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer"), /rejected/);
+    await assert.rejects(() => controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" }), /rejected/);
     assert.equal(branch.some((entry) => entry?.data?.type === "fork.created"), false);
     assert.equal(agents.destroyed, 1);
   } finally {
@@ -259,7 +328,7 @@ function harness(root: string, branch: any[], sent: any[] = [], sendOptions: any
     appendEntry(_type: string, data: unknown) { branch.push({ type: "custom", customType: "pi-async-fork", data }); },
     sendMessage(message: unknown, options: unknown) { sent.push(message); sendOptions.push(options); },
   };
-  const ctx = { cwd: root, sessionManager: {
+  const ctx = { cwd: root, isIdle: () => true, signal: undefined as AbortSignal | undefined, sessionManager: {
     getBranch: () => branch,
     getSessionFile: () => join(root, "parent.jsonl"),
     getHeader: () => ({ type: "session", version: 3, id: "parent", cwd: root }),
@@ -290,7 +359,7 @@ test("buffers a fast candidate until task acceptance registers the fork", async 
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
     await controller.beforeTree();
-    const creating = controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const creating = controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     await waitForLifecycle();
     assert.equal(branch.some((item) => item?.data?.type === "fork.created"), false);
     assert.equal(agents.destroyed, 0);
@@ -317,7 +386,7 @@ test("starts the no-output grace period when idle is observed", async () => {
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     now = 50_000;
     agents.statusUpdate("idle");
     await waitForLifecycle();
@@ -347,7 +416,7 @@ test("defers inactive-branch completion until the owning branch is active again"
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     branch = [];
     agents.candidate({ text: "Answer", cursor: "c1" });
     agents.statusUpdate("idle");
@@ -376,7 +445,7 @@ test("keeps a valid active state when activity diagnostics fail", async () => {
   const agents = new FakeAgents();
   const controller = new Controller(pi, configuration, agents);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.collectError = new Error("diagnostic stream failed");
     const result = await controller.status(ctx, forkId);
     assert.equal(result.state, "working");
@@ -397,7 +466,7 @@ test("reprojects status after activity collection finishes during finalization",
   agents.collectHook = () => activity;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     const pendingStatus = controller.status(ctx, forkId);
     await Promise.resolve();
     agents.candidate({ text: "Answer", cursor: "c1" });
@@ -424,7 +493,7 @@ test("returns current raw status after activity collection", async () => {
   agents.collectHook = () => activity;
   const controller = new Controller(pi, configuration, agents);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     const pendingStatus = controller.status(ctx, forkId);
     await Promise.resolve();
     agents.state = "idle";
@@ -454,7 +523,7 @@ test("returns completed status when the post-collection status call loses a fina
   };
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     const pendingStatus = controller.status(ctx, forkId);
     await secondStatus;
     agents.candidate({ text: "Answer", cursor: "c1" });
@@ -582,7 +651,7 @@ test("retains the child session when failed creation cleanup leaves an agent ali
   const controller = new Controller(pi, configuration, agents);
   try {
     await assert.rejects(
-      () => controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer"),
+      () => controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" }),
       /Agent cleanup failed: destroy failed.*Child session retained/,
     );
     assert.equal(branch.some((item) => item?.data?.type === "fork.created"), false);
@@ -601,7 +670,7 @@ test("serializes accepted steering before automatic destruction", async () => {
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     let sendStarted!: () => void;
     const started = new Promise<void>((resolve) => { sendStarted = resolve; });
     let releaseSend!: () => void;
@@ -646,7 +715,7 @@ test("rejects direct creation from a marked child session", async () => {
     },
   };
   await assert.rejects(
-    () => controller.create(ctx, "call", "research", "Do the task.", "Complete the assigned task"),
+    () => controller.create(ctx, "call", "research", "Do the task.", "Complete the assigned task", { role: "investigate", effort: "balanced" }),
     /This session is an async fork\. Async fork tools are unavailable here\./,
   );
   assert.equal(agents.observed, 0);
@@ -681,7 +750,7 @@ test("reports state-directory mismatch and ignores abort after accepted steering
     branch.length = 0;
     branch.push(...invokingBranch());
     await controller.afterTree(ctx);
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     const abort = new AbortController();
     agents.steer = async (_agent, message) => { agents.sent.push(message); abort.abort(); };
     await controller.steer(ctx, forkId, "Continue.", abort.signal);
@@ -698,7 +767,7 @@ test("delivers a continued report as progress without destroying the fork", asyn
   const agents = new FakeAgents();
   const controller = new Controller(pi, configuration, agents, () => 0);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     agents.activity();
     agents.statusUpdate("working");
@@ -721,7 +790,7 @@ test("preserves progress order and finalizes only the last pending report after 
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Checkpoint one", cursor: "progress-1" });
     agents.activity();
     agents.candidate({ text: "Checkpoint two", cursor: "progress-2" });
@@ -752,7 +821,7 @@ test("late continuation and accepted steering preserve progress before finalizat
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     agents.statusUpdate("idle");
     await waitForLifecycle();
@@ -778,7 +847,7 @@ test("defers progress on an inactive branch and suppresses a replayed delivered 
   const agents = new FakeAgents();
   const controller = new Controller(pi, configuration, agents, () => 0);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     branch = [];
     agents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     agents.activity();
@@ -813,7 +882,7 @@ test("keeps delayed activity from turning an idle fork back into working", async
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Final answer", cursor: "final-1" });
     agents.statusUpdate("idle");
     agents.activity();
@@ -838,7 +907,7 @@ test("does not send stale progress after failed status arrives before delayed ac
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     agents.statusUpdate("failed");
     agents.activity();
@@ -885,7 +954,7 @@ test("classifies a prior visible report as progress when a newer report arrives"
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     agents.candidate({ text: "Final answer", cursor: "final-1" });
     agents.statusUpdate("working");
@@ -910,7 +979,7 @@ test("does not redeliver a persisted progress cursor after controller restart", 
   const firstAgents = new FakeAgents();
   const first = new Controller(pi, configuration, firstAgents, () => 0);
   try {
-    const forkId = await first.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await first.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     firstAgents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     firstAgents.activity();
     firstAgents.statusUpdate("working");
@@ -940,7 +1009,7 @@ test("sends a terminal notice after delivered progress when the fork fails", asy
   let now = 0;
   const controller = new Controller(pi, configuration, agents, () => now);
   try {
-    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     agents.activity();
     agents.statusUpdate("working");
@@ -967,7 +1036,7 @@ test("fork status reports raw state without reordering lifecycle observation", a
   const agents = new FakeAgents();
   const controller = new Controller(pi, configuration, agents, () => 0);
   try {
-    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer");
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
     agents.candidate({ text: "Checkpoint", cursor: "progress-1" });
     agents.activity();
     agents.activityCollection = {
@@ -994,4 +1063,376 @@ test("fork status reports raw state without reordering lifecycle observation", a
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+
+async function cancellationHarness(run: (h: any) => Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), "pi-async-fork-cancel-"));
+  const branch: any[] = invokingBranch();
+  const { pi, ctx, sent } = harness(root, branch);
+  const agents = new FakeAgents();
+  let now = 0;
+  const controller = new Controller(pi, configuration, agents, () => now);
+  try {
+    const forkId = await controller.create(ctx, "call-1", "research", "Find the answer.", "Find the requested answer", { role: "investigate", effort: "balanced" });
+    await waitForLifecycle();
+    await run({ root, branch, pi, ctx, sent, agents, controller, forkId, advance: () => { now += 10_000; } });
+  } finally {
+    await controller.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+function destroyedEntries(branch: any[]) {
+  return branch.filter((entry) => entry?.data?.type === "fork.destroyed");
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+test("cancels an active fork once, requests a notice and retains its child session", async () => {
+  await cancellationHarness(async ({ root, branch, ctx, sent, agents, controller, forkId }) => {
+    assert.deepEqual(await controller.cancel(ctx, forkId, "Scope changed"), { state: "completed", outcome: "cancelled" });
+    assert.equal(agents.destroyed, 1);
+    assert.equal(destroyedEntries(branch).length, 1);
+    assert.equal(destroyedEntries(branch)[0].data.kind, "notice");
+    assert.equal(destroyedEntries(branch)[0].data.output, "Fork explicitly cancelled. Reason: Scope changed");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].details.kind, "notice");
+    assert.equal((await readdir(join(root, "async-forks"))).length, 1);
+    assert.deepEqual(await controller.status(ctx, forkId), { state: "completed", description: "Find the requested answer" });
+    assert.deepEqual(await controller.cancel(ctx, forkId), { state: "completed", outcome: "already_completed" });
+    assert.equal(agents.destroyed, 1);
+    assert.equal(sent.length, 1);
+  });
+});
+
+test("serializes repeated cancellation and ignores callbacks queued after it", async () => {
+  await cancellationHarness(async ({ branch, ctx, sent, agents, controller, forkId, advance }) => {
+    const started = deferred();
+    const release = deferred();
+    agents.destroyHook = async () => { started.resolve(); await release.promise; };
+    const first = controller.cancel(ctx, forkId);
+    await started.promise;
+    const second = controller.cancel(ctx, forkId);
+    agents.candidate({ text: "Late answer", cursor: "late" });
+    agents.statusUpdate("idle");
+    advance();
+    agents.statusUpdate("idle");
+    release.resolve();
+    assert.equal((await first).outcome, "cancelled");
+    assert.equal((await second).outcome, "already_completed");
+    await waitForLifecycle();
+    assert.equal(agents.destroyed, 1);
+    assert.equal(destroyedEntries(branch).length, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].content, /explicitly cancelled/);
+    assert.doesNotMatch(sent[0].content, /Late answer/);
+  });
+});
+
+test("cancels idle forks during grace but preserves an already finalized response", async () => {
+  for (const finalized of [false, true]) {
+    await cancellationHarness(async ({ branch, ctx, sent, agents, controller, forkId, advance }) => {
+      agents.candidate({ text: "Answer", cursor: "c1" });
+      agents.statusUpdate("idle");
+      await waitForLifecycle();
+      if (finalized) {
+        advance();
+        agents.statusUpdate("idle");
+        await waitForLifecycle();
+      }
+      const result = await controller.cancel(ctx, forkId);
+      assert.equal(result.outcome, finalized ? "already_completed" : "cancelled");
+      assert.equal(agents.destroyed, 1);
+      assert.equal(destroyedEntries(branch).length, 1);
+      assert.equal(sent.length, 1);
+      assert.equal(destroyedEntries(branch)[0].data.kind, finalized ? "response" : "notice");
+    });
+  }
+});
+
+test("completion already in the lifecycle queue wins over cancellation", async () => {
+  await cancellationHarness(async ({ branch, ctx, agents, controller, forkId, advance }) => {
+    agents.candidate({ text: "Answer", cursor: "c1" });
+    agents.statusUpdate("idle");
+    await waitForLifecycle();
+    const started = deferred();
+    const release = deferred();
+    agents.destroyHook = async () => { started.resolve(); await release.promise; };
+    advance();
+    agents.statusUpdate("idle");
+    await started.promise;
+    const cancelling = controller.cancel(ctx, forkId);
+    release.resolve();
+    assert.equal((await cancelling).outcome, "already_completed");
+    assert.equal(agents.destroyed, 1);
+    assert.equal(destroyedEntries(branch)[0].data.output, "Answer");
+  });
+});
+
+test("cancellation rejects inactive branches and mismatched immutable identities", async () => {
+  await cancellationHarness(async ({ branch, ctx, agents, controller, forkId }) => {
+    ctx.sessionManager.getBranch = () => [];
+    await assert.rejects(() => controller.cancel(ctx, forkId), /not found on this session branch/);
+    ctx.sessionManager.getBranch = () => branch;
+    const record = branch.find((entry: any) => entry?.data?.type === "fork.created");
+    record.data.agentId = "replacement-agent";
+    await assert.rejects(() => controller.cancel(ctx, forkId), /unavailable in this session/);
+    assert.equal(agents.destroyed, 0);
+    assert.equal(destroyedEntries(branch).length, 0);
+  });
+});
+
+test("queued cancellation rejects a reconciled stale context", async () => {
+  await cancellationHarness(async ({ ctx, agents, controller, forkId }) => {
+    const started = deferred();
+    const release = deferred();
+    agents.steer = async () => { started.resolve(); await release.promise; };
+    const steering = controller.steer(ctx, forkId, "Continue.");
+    await started.promise;
+    const cancelling = controller.cancel(ctx, forkId);
+    const rejected = assert.rejects(() => cancelling, /context changed/);
+    await controller.afterTree(ctx);
+    release.resolve();
+    await steering;
+    await rejected;
+    assert.equal(agents.destroyed, 0);
+  });
+});
+
+test("tree transition drains cancellation already destroying an agent", async () => {
+  await cancellationHarness(async ({ branch, ctx, agents, controller, forkId }) => {
+    const started = deferred();
+    const release = deferred();
+    agents.destroyHook = async () => { started.resolve(); await release.promise; };
+    const cancelling = controller.cancel(ctx, forkId);
+    await started.promise;
+    let transitioned = false;
+    const transition = controller.beforeTree().then(() => { transitioned = true; });
+    await waitForLifecycle();
+    assert.equal(transitioned, false);
+    release.resolve();
+    assert.equal((await cancelling).outcome, "cancelled");
+    await transition;
+    assert.equal(destroyedEntries(branch).length, 1);
+  });
+});
+
+test("cancellation recovers an aborted tree pause but rejects an ongoing tree transition", async () => {
+  await cancellationHarness(async ({ ctx, agents, controller, forkId }) => {
+    await controller.beforeTree();
+    ctx.isIdle = () => false;
+    await assert.rejects(() => controller.cancel(ctx, forkId), /tree navigation/);
+    assert.equal(agents.destroyed, 0);
+    // A veto leaves no session_tree event. A later idle or model turn proves
+    // that the runtime has left navigation; both must permit cancellation.
+    ctx.isIdle = () => true;
+    assert.equal((await controller.cancel(ctx, forkId)).outcome, "cancelled");
+  });
+  await cancellationHarness(async ({ ctx, controller, forkId }) => {
+    await controller.beforeTree();
+    ctx.isIdle = () => false;
+    ctx.signal = new AbortController().signal;
+    assert.equal((await controller.cancel(ctx, forkId)).outcome, "cancelled");
+  });
+});
+
+test("does not report success or append a notice when destruction fails", async () => {
+  await cancellationHarness(async ({ branch, ctx, sent, agents, controller, forkId }) => {
+    agents.destroyHook = async () => { throw new Error("SDK failure"); };
+    await assert.rejects(() => controller.cancel(ctx, forkId), /Could not confirm.*SDK failure/);
+    assert.equal(destroyedEntries(branch).length, 0);
+    assert.equal(sent.length, 0);
+  });
+});
+
+test("reports recording failure even when append mutated the in-memory branch", async () => {
+  for (const mutateFirst of [false, true]) {
+    await cancellationHarness(async ({ branch, pi, ctx, sent, agents, controller, forkId }) => {
+      const append = pi.appendEntry;
+      pi.appendEntry = (type: string, data: any) => {
+        if (mutateFirst) append(type, data);
+        throw new Error("EIO disk failure");
+      };
+      await assert.rejects(() => controller.cancel(ctx, forkId), /SDK confirmed.*recording.*EIO disk failure/);
+      assert.equal(agents.destroyed, 1);
+      assert.equal(sent.length, 0);
+      await assert.rejects(() => controller.cancel(ctx, forkId), /recording.*EIO disk failure/);
+      assert.equal(agents.destroyed, 1);
+    });
+  }
+});
+
+test("retains recording failures across navigation without replaying memory-only outcomes", async () => {
+  for (const mutateFirst of [false, true]) {
+    await cancellationHarness(async ({ branch, pi, ctx, sent, agents, controller, forkId }) => {
+      const append = pi.appendEntry;
+      pi.appendEntry = (type: string, data: any) => {
+        if (mutateFirst) append(type, data);
+        throw new Error("EIO disk failure");
+      };
+      await assert.rejects(() => controller.cancel(ctx, forkId), /recording.*EIO disk failure/);
+      pi.appendEntry = append;
+
+      // Leave the owning branch, then return to its possibly memory-only entry.
+      await controller.beforeTree();
+      ctx.sessionManager.getBranch = () => [];
+      await controller.afterTree(ctx);
+      await assert.rejects(() => controller.cancel(ctx, forkId), /not found on this session branch/);
+      await assert.rejects(() => controller.status(ctx, forkId), /not found on this session branch/);
+      await controller.beforeTree();
+      ctx.sessionManager.getBranch = () => branch;
+      await controller.afterTree(ctx);
+
+      await assert.rejects(() => controller.cancel(ctx, forkId), /recording.*EIO disk failure/);
+      await assert.rejects(() => controller.status(ctx, forkId), /recording.*EIO disk failure/);
+      assert.equal(agents.destroyed, 1);
+      assert.equal(agents.observed, 1, "must not restore the confirmed stopped agent");
+      assert.equal(sent.length, 0, "must not replay an outcome whose recording failed");
+    });
+  }
+});
+
+test("recording failures do not leak to a different immutable agent on another branch", async () => {
+  await cancellationHarness(async ({ branch, pi, ctx, sent, agents, controller, forkId }) => {
+    const append = pi.appendEntry;
+    pi.appendEntry = (type: string, data: any) => {
+      append(type, data);
+      throw new Error("EIO disk failure");
+    };
+    await assert.rejects(() => controller.cancel(ctx, forkId), /recording.*EIO disk failure/);
+    pi.appendEntry = append;
+    const created = branch.find((entry: any) => entry?.data?.type === "fork.created").data;
+    const otherBranch = [
+      { type: "custom", customType: "pi-async-fork", data: { ...created, agentId: "other-agent" } },
+      { type: "custom", customType: "pi-async-fork", data: {
+        type: "fork.destroyed", forkId, agentId: "other-agent", kind: "response", output: "Other outcome",
+      } },
+    ];
+    await controller.beforeTree();
+    ctx.sessionManager.getBranch = () => otherBranch;
+    await controller.afterTree(ctx);
+    assert.equal((await controller.cancel(ctx, forkId)).outcome, "already_completed");
+    assert.equal((await controller.status(ctx, forkId)).state, "completed");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].details.agentId, "other-agent");
+
+    await controller.beforeTree();
+    ctx.sessionManager.getBranch = () => branch;
+    await controller.afterTree(ctx);
+    await assert.rejects(() => controller.cancel(ctx, forkId), /recording.*EIO disk failure/);
+    await assert.rejects(() => controller.status(ctx, forkId), /recording.*EIO disk failure/);
+    assert.equal(agents.destroyed, 1);
+    assert.equal(sent.length, 1);
+  });
+});
+
+test("reconciliation still retries transient restoration failures", async () => {
+  await cancellationHarness(async ({ ctx, agents, controller, forkId }) => {
+    const restore = agents.restore.bind(agents);
+    agents.restore = async () => { throw new Error("Temporary fleet outage"); };
+    await controller.beforeTree();
+    await controller.afterTree(ctx);
+    await assert.rejects(() => controller.status(ctx, forkId), /Temporary fleet outage/);
+
+    agents.restore = restore;
+    await controller.beforeTree();
+    await controller.afterTree(ctx);
+    assert.equal((await controller.status(ctx, forkId)).state, "working");
+    assert.equal((await controller.cancel(ctx, forkId)).outcome, "cancelled");
+    assert.equal(agents.destroyed, 1);
+  });
+});
+
+test("status collection cannot turn a concurrent recording failure into completion", async () => {
+  await cancellationHarness(async ({ pi, ctx, agents, controller, forkId }) => {
+    const collecting = deferred();
+    const release = deferred();
+    agents.collectHook = async () => {
+      collecting.resolve();
+      await release.promise;
+      return agents.activityCollection;
+    };
+    const status = controller.status(ctx, forkId);
+    const rejected = assert.rejects(() => status, /recording.*EIO disk failure/);
+    await collecting.promise;
+    const append = pi.appendEntry;
+    pi.appendEntry = (type: string, data: any) => {
+      append(type, data);
+      throw new Error("EIO disk failure");
+    };
+    await assert.rejects(() => controller.cancel(ctx, forkId), /recording.*EIO disk failure/);
+    release.resolve();
+    await rejected;
+    assert.equal(agents.destroyed, 1);
+  });
+});
+
+test("reports synchronous notification failure after keeping the recorded outcome", async () => {
+  await cancellationHarness(async ({ branch, pi, ctx, agents, controller, forkId }) => {
+    pi.sendMessage = () => { throw new Error("Notification rejected"); };
+    await assert.rejects(() => controller.cancel(ctx, forkId), /recorded.*requesting.*Notification rejected/);
+    assert.equal(destroyedEntries(branch).length, 1);
+    assert.equal(agents.destroyed, 1);
+    assert.equal((await controller.cancel(ctx, forkId)).outcome, "already_completed");
+    const notifications: any[] = [];
+    pi.sendMessage = (message: any) => { notifications.push(message); };
+    await controller.afterTree(ctx);
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0].content, /explicitly cancelled/);
+    assert.equal(agents.destroyed, 1);
+  });
+});
+
+test("abort before destroy has no effect; abort during destroy still records cancellation", async () => {
+  for (const during of [false, true]) {
+    await cancellationHarness(async ({ branch, ctx, sent, agents, controller, forkId }) => {
+      const abort = new AbortController();
+      if (during) agents.destroyHook = async () => { abort.abort(); };
+      else abort.abort();
+      if (during) {
+        assert.equal((await controller.cancel(ctx, forkId, undefined, abort.signal)).outcome, "cancelled");
+        assert.equal(destroyedEntries(branch).length, 1);
+        assert.equal(sent.length, 1);
+      } else {
+        await assert.rejects(() => controller.cancel(ctx, forkId, undefined, abort.signal), /aborted/);
+        assert.equal(agents.destroyed, 0);
+        assert.equal(destroyedEntries(branch).length, 0);
+      }
+    });
+  }
+});
+
+test("cancellation rechecks abort after waiting behind an accepted steer", async () => {
+  await cancellationHarness(async ({ branch, ctx, agents, controller, forkId }) => {
+    const started = deferred();
+    const release = deferred();
+    agents.steer = async () => { started.resolve(); await release.promise; };
+    const steering = controller.steer(ctx, forkId, "Continue.");
+    await started.promise;
+    const abort = new AbortController();
+    const cancelling = controller.cancel(ctx, forkId, undefined, abort.signal);
+    const rejected = assert.rejects(() => cancelling, /aborted/);
+    abort.abort();
+    release.resolve();
+    await steering;
+    await rejected;
+    assert.equal(agents.destroyed, 0);
+    assert.equal(destroyedEntries(branch).length, 0);
+  });
+});
+
+test("direct cancellation rejects marked child sessions before lifecycle work", async () => {
+  const agents = new FakeAgents();
+  const controller = new Controller({}, configuration, agents);
+  const ctx = { sessionManager: {
+    getHeader: () => ({ id: "child" }),
+    getEntries: () => [{ type: "custom", customType: "pi-async-fork-child", data: { version: 1, sessionId: "child", forkId: "parent-1234567" } }],
+  } };
+  await assert.rejects(() => controller.cancel(ctx, "research-1234567"), /Async fork tools are unavailable here/);
+  assert.equal(agents.destroyed, 0);
 });

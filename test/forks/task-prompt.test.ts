@@ -3,14 +3,14 @@ import test from "node:test";
 import { buildAssignedTask, buildForkBoundary } from "../../src/forks/task-prompt.js";
 
 test("frames fork ownership in an assistant boundary", () => {
-  const boundary = buildForkBoundary("research-1234567");
+  const boundary = buildForkBoundary("research-1234567", "investigate", "inherit");
   assert.match(boundary, /^I am a fork\. I am not the main agent\./);
   assert.match(boundary, /The earlier conversation records work done by the main agent\./);
   assert.match(boundary, /Its assistant messages are not my previous actions\./);
   assert.match(boundary, /The next user message is my only active task\./);
   assert.match(boundary, /Stay within the assigned scope\. Do not expand into adjacent or broader work\./);
   assert.match(boundary, /Report blockers and out-of-scope findings instead of acting on them\./);
-  assert.match(boundary, /I must not call `create_fork`, `fork_status`, or `steer_fork`\./);
+  assert.match(boundary, /I must not call `create_fork`, `fork_status`, `steer_fork`, or `cancel_fork`\./);
   assert.match(boundary, /Their availability does not permit me to use them\./);
   assert.match(boundary, /I must complete or report this task during the current run\./);
   assert.match(boundary, /I must not defer work or results to a later run, future wake-up, or external continuation\./);
@@ -26,6 +26,31 @@ test("frames fork ownership in an assistant boundary", () => {
   assert.match(boundary, /Every visible report will use the required headings below\. For the final report, I will follow this report contract:/);
   assert.match(boundary, /<report_contract>[\s\S]*After completing the task[\s\S]*## Output[\s\S]*## Learnings[\s\S]*<\/report_contract>/);
   assert.equal(boundary.endsWith("Fork ID: research-1234567"), true);
+});
+
+test("composes role contracts independently of context without capacity-based permissions", () => {
+  for (const role of ["investigate", "execute", "verify"] as const) {
+    for (const context of ["inherit", "isolated"] as const) {
+      const boundary = buildForkBoundary("review-1234567", role, context);
+      assert.match(boundary, /^I am a fork\. I am not the main agent\./);
+      assert.match(boundary, new RegExp(`Role: ${role}\\.`));
+      if (context === "isolated") {
+        assert.match(boundary, /prior conversation was not supplied/);
+        assert.doesNotMatch(boundary, /The earlier conversation records/);
+      }
+      if (role === "execute") {
+        assert.match(boundary, /including necessary writes and ordinary local decisions/);
+        assert.match(boundary, /Stop and report ambiguity/);
+        assert.doesNotMatch(boundary, /Do not implement or modify|Do not fix the reviewed/);
+      } else {
+        assert.match(boundary, /Read-only/);
+        assert.match(boundary, role === "verify" ? /Do not fix the reviewed work/ : /Do not implement or modify the investigated work/);
+      }
+      assert.match(boundary, /instruction contract, not a sandbox/);
+      assert.match(boundary, /shell\/CLI delegation/);
+      assert.equal(boundary.endsWith("Fork ID: review-1234567"), true);
+    }
+  }
 });
 
 test("places conditional progress guidance after the unchanged task and before the final format requirement", () => {

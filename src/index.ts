@@ -1,10 +1,13 @@
 import { Type } from "@sinclair/typebox";
-import { loadConfiguration, TIERS, type Tier } from "./configuration.js";
-import { Controller } from "./forks/controller.js";
+import { loadConfiguration, TIERS } from "./configuration.js";
+import { Controller, type CreationOptions } from "./forks/controller.js";
+import { CONTEXTS, ROLES } from "./forks/task-prompt.js";
 import type { ActivityCollection, ActivityEntry } from "./forks/agent.js";
 import { RESULT_TYPE } from "./forks/ledger.js";
 import { assertForkToolsAvailable, FORK_CHILD_ERROR, isForkChildSession } from "./forks/session.js";
 import {
+  renderCancelForkCall,
+  renderCancelForkResult,
   renderCreateForkCall,
   renderCreateForkResult,
   renderForkResultMessage,
@@ -17,7 +20,9 @@ import {
 const NAME_DESCRIPTION = "Choose one or two short lowercase letter-only words, separated by one hyphen if there are two. Do not add numbers. The tool adds a generated seven-digit suffix to your name and returns the complete fork ID. Use that returned ID for later calls.";
 const TASK_DESCRIPTION = "Describe the focused task you want the fork to complete. State what to do and where the fork's decision authority ends. The fork reports blockers and ambiguities outside that authority instead of resolving them on your behalf.";
 const DESCRIPTION_DESCRIPTION = "Summarize the fork's purpose in 3 to 6 words for the user. Describe the work, not the fork mechanics. Example: \"Trace login session validation\".";
-const EFFORT_DESCRIPTION = "Choose the fork's reasoning effort. Select it from the primary cognitive job and required reasoning depth. Use the lowest effort that can reliably complete the task. Effort changes reasoning depth, not task scope. Use fast for bounded read-only evidence gathering, including lookups, codebase exploration, documentation or web research, exact checks, inventories, and source or relationship tracing. Fast returns facts and does not make final judgments, recommendations, diagnoses, approval or gate decisions, or changes. Use balanced for bounded judgment or settled execution, including review, plan validation, test interpretation, bounded diagnosis, research synthesis, implementation planning, and scoped changes. Use deep for frontier uncertainty or the hardest reasoning, including novel architecture, unclear root causes, conflicting evidence, difficult security or data analysis, complex system behavior, major product decisions, broad blast radius, and hard-to-reverse choices. If fast evidence needs judgment, use balanced; if it exposes complex uncertainty, use deep. If unsure, use balanced. Deep is expensive and has more reasoning capability than you. Use it only when that additional capability is necessary for the outcome.";
+const ROLE_DESCRIPTION = "Explicitly choose the bounded work contract: investigate is read-only discovery, analysis, or diagnosis; execute performs only the authorized bounded outcome, including necessary writes; verify is read-only independent verification, reporting findings without fixes. Read-only is an instruction contract, not a sandbox. Roles do not expand authorization or transfer main ownership.";
+const EFFORT_DESCRIPTION = "Choose the fork's reasoning effort explicitly. Use the lowest effort that can reliably complete the result. Fast covers straightforward bounded work with little unresolved judgment, including fully specified implementation. Balanced covers ordinary significant judgment. Deep covers genuinely difficult unresolved uncertainty where additional reasoning can materially change the outcome. Effort selects only the configured model/thinking profile, not role, permission, scope, context, or authority. Writing files alone does not justify a stronger model. Profile names do not prove relative capability or cost.";
+const CONTEXT_DESCRIPTION = "Choose parent conversation-history inheritance: inherit copies the active branch up to this call; isolated starts without parent history. Omit to use the role default: investigate and execute default to inherit; verify defaults to isolated. All roles may override either mode. Isolated retains lineage and the same system/project resources, tools, environment, and filesystem; it is not a sandbox. Supply a self-contained task and evidence for isolated work.";
 const ID_DESCRIPTION = "Use the complete fork ID returned by create_fork. Do not shorten, modify, or reconstruct it.";
 const STATUS_LIMIT_DESCRIPTION = "Optional positive integer. When supplied, return only the latest observed activity entries. Without it, return all observed entries within output limits.";
 
@@ -118,12 +123,14 @@ export default function register(pi: any): void {
       name: Type.String({ description: NAME_DESCRIPTION }),
       task: Type.String({ description: TASK_DESCRIPTION }),
       description: Type.String({ description: DESCRIPTION_DESCRIPTION }),
-      effort: Type.Optional(Type.Union(TIERS.map((effort) => Type.Literal(effort)), { description: EFFORT_DESCRIPTION })),
+      role: Type.Union(ROLES.map((role) => Type.Literal(role)), { description: ROLE_DESCRIPTION }),
+      effort: Type.Union(TIERS.map((effort) => Type.Literal(effort)), { description: EFFORT_DESCRIPTION }),
+      context: Type.Optional(Type.Union(CONTEXTS.map((context) => Type.Literal(context)), { description: CONTEXT_DESCRIPTION })),
     }),
     renderCall: renderCreateForkCall,
     renderResult: renderCreateForkResult,
-    async execute(toolCallId: string, params: { name: string; task: string; description: string; effort?: Tier }, signal: AbortSignal, _onUpdate: any, ctx: any) {
-      const forkId = await getController(ctx).create(ctx, toolCallId, params.name, params.task, params.description, params.effort ?? "balanced", signal);
+    async execute(toolCallId: string, params: { name: string; task: string; description: string } & CreationOptions, signal: AbortSignal, _onUpdate: any, ctx: any) {
+      const forkId = await getController(ctx).create(ctx, toolCallId, params.name, params.task, params.description, { role: params.role, effort: params.effort, context: params.context }, signal);
       return { content: [{ type: "text", text: forkId }], details: { forkId } };
     },
   });
@@ -161,6 +168,22 @@ export default function register(pi: any): void {
         content: [{ type: "text", text }],
         details: status.activity ? { ...status, activityText: activityText(status.activity) } : status,
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "cancel_fork",
+    label: "Cancel async fork",
+    description: `Explicitly cancel an async fork on the current session branch. Repeated cancellation is safe; an already completed fork keeps its original outcome. This ends the agent but does not undo file changes or guarantee stopping external jobs or every custom-tool subprocess. Cancellation may wait for earlier lifecycle operations. ${ID_DESCRIPTION}`,
+    parameters: Type.Object({
+      forkId: Type.String({ description: ID_DESCRIPTION }),
+      reason: Type.Optional(Type.String({ description: "Optional reason to include in the cancellation notice." })),
+    }),
+    renderCall: renderCancelForkCall,
+    renderResult: renderCancelForkResult,
+    async execute(_toolCallId: string, params: { forkId: string; reason?: string }, signal: AbortSignal, _onUpdate: any, ctx: any) {
+      const result = await getController(ctx).cancel(ctx, params.forkId, params.reason, signal);
+      return { content: [{ type: "text", text: `${params.forkId}: ${result.outcome}` }], details: result };
     },
   });
 }

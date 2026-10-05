@@ -1,11 +1,15 @@
 import { AgentNameTakenError, type Agent, type AgentState } from "@elpapi42/pi-fleet-sdk";
-import type { Configuration, Tier } from "../configuration.js";
+import { TIERS, type Configuration, type Tier } from "../configuration.js";
 import { Agents, type ActivityCollection, type Candidate, type ManagedAgents } from "./agent.js";
 import { Delivery } from "./delivery.js";
 import { createId, maxIdAttempts, validateDescription } from "./identity.js";
 import { active, appendCreated, appendDestroyed, project, type Created, type Destroyed } from "./ledger.js";
 import { assertForkToolsAvailable, createChildSession, removeChildSession } from "./session.js";
-import { buildAssignedTask } from "./task-prompt.js";
+import { buildAssignedTask, CONTEXTS, defaultContext, ROLES, type ForkContext, type ForkRole } from "./task-prompt.js";
+
+export type CreationOptions = { role: ForkRole; effort: Tier; context?: ForkContext };
+
+export type CancelResult = { state: "completed"; outcome: "cancelled" | "already_completed" };
 
 type PendingReport = Candidate & { continued: boolean };
 
@@ -36,6 +40,7 @@ export class Controller {
   readonly #delivery = new Delivery();
   readonly #running = new Map<string, Running>();
   readonly #unavailable = new Map<string, string>();
+  readonly #recordingFailures = new Map<string, { forkId: string; message: string }>();
   #generation = 0;
   #paused = false;
   #lifecycleTail: Promise<void> = Promise.resolve();
@@ -81,6 +86,7 @@ export class Controller {
     await this.#lifecycleTail.catch(() => undefined);
     this.#running.clear();
     this.#unavailable.clear();
+    this.#recordingFailures.clear();
     await this.#agents.stop();
   }
 
@@ -93,6 +99,11 @@ export class Controller {
     const records = project(entries);
     for (const record of records.values()) {
       if (!this.isGeneration(generation)) return;
+      const recordingFailure = this.recordingFailure(record);
+      if (recordingFailure) {
+        this.#unavailable.set(record.forkId, recordingFailure);
+        continue;
+      }
       if (record.destroyed) {
         if (!this.#delivery.wasDelivered(ctx.sessionManager.getBranch(), record.forkId, record.agentId, record.destroyed.cursor)) {
           await this.#delivery.deliver(this.#pi, record.forkId, record.agentId, record.destroyed.kind, record.destroyed.output, record.destroyed.cursor, record.description);
@@ -115,17 +126,22 @@ export class Controller {
     }
   }
 
-  async create(ctx: any, toolCallId: string, name: string, task: string, description: string, tier: Tier = "balanced", signal?: AbortSignal): Promise<string> {
-    this.resume();
+  async create(ctx: any, toolCallId: string, name: string, task: string, description: string, options: CreationOptions, signal?: AbortSignal): Promise<string> {
     assertForkToolsAvailable(ctx.sessionManager);
+    if (!ROLES.includes(options?.role)) throw new Error("Fork role must be explicitly investigate, execute, or verify.");
+    if (!TIERS.includes(options?.effort)) throw new Error("Fork effort must be explicitly fast, balanced, or deep.");
+    if (options.context !== undefined && !CONTEXTS.includes(options.context)) throw new Error("Fork context must be inherit or isolated.");
+    const { role, effort: tier } = options;
+    const context = options.context ?? defaultContext(role);
     description = validateDescription(description);
+    this.resume();
     const existingIds = new Set(project(ctx.sessionManager.getBranch()).keys());
     for (let attempt = 0; attempt < maxIdAttempts; attempt += 1) {
       throwIfAborted(signal);
       const forkId = createId(name);
       if (existingIds.has(forkId)) continue;
       existingIds.add(forkId);
-      const child = await createChildSession(ctx.sessionManager, toolCallId, forkId);
+      const child = await createChildSession(ctx.sessionManager, toolCallId, forkId, { role, context, cwd: ctx.cwd });
       let agent: Agent | undefined;
       try {
         const profile = this.#configuration.profiles[tier];
@@ -144,6 +160,8 @@ export class Controller {
           ...(this.#configuration.stateDir ? { stateDir: this.#configuration.stateDir } : {}),
           sessionPath: child.path,
           tier,
+          role,
+          context,
           description,
         };
         const running: Running = { ...created, agent, registered: false, reports: [] };
@@ -205,10 +223,39 @@ export class Controller {
     });
   }
 
+  async cancel(ctx: any, forkId: string, reason?: string, signal?: AbortSignal): Promise<CancelResult> {
+    assertForkToolsAvailable(ctx.sessionManager);
+    const generation = this.#generation;
+    return this.enqueue(async () => {
+      throwIfAborted(signal);
+      if (!this.isGeneration(generation)) throw new Error("Async fork context changed before cancellation.");
+      if (this.#paused) {
+        // A veto or aborted summary can leave session_before_tree without a
+        // session_tree. Idle, or a new agent turn, proves navigation has ended.
+        // During navigation Pi is not idle and has no active agent signal.
+        if (ctx.isIdle?.() !== true && (!ctx.signal || ctx.signal.aborted)) throw new Error("Cannot cancel a fork during session tree navigation.");
+        this.resume();
+      }
+      const record = project(ctx.sessionManager.getBranch()).get(forkId);
+      if (!record) throw new Error(`Fork ${forkId} was not found on this session branch.`);
+      this.assertOutcomeRecorded(record);
+      const running = this.#running.get(forkId);
+      if (record.destroyed) return { state: "completed", outcome: "already_completed" };
+      if (!running || !running.registered || running.agentId !== record.agentId) {
+        throw new Error(this.#unavailable.get(forkId) ?? `Fork ${forkId} is unavailable in this session.`);
+      }
+      const output = `Fork explicitly cancelled.${reason ? ` Reason: ${reason}` : ""}`;
+      const applied = await this.finalize(ctx, running, "notice", output, undefined, generation);
+      if (!applied) throw new Error("Async fork context changed before cancellation could start.");
+      return { state: "completed", outcome: "cancelled" };
+    });
+  }
+
   async status(ctx: any, forkId: string, limit?: number, signal?: AbortSignal): Promise<{ state: AgentState | "completed"; description?: string; activity?: ActivityCollection }> {
     this.resume();
     const record = project(ctx.sessionManager.getBranch()).get(forkId);
     if (!record) throw new Error(`Fork ${forkId} was not found on this session branch.`);
+    this.assertOutcomeRecorded(record);
     const description = record.description ? { description: record.description } : {};
     if (record.destroyed) return { state: "completed", ...description };
     const running = this.#running.get(forkId);
@@ -223,6 +270,7 @@ export class Controller {
     }
     const current = project(ctx.sessionManager.getBranch()).get(forkId);
     if (!current) throw new Error(`Fork ${forkId} was not found on this session branch.`);
+    this.assertOutcomeRecorded(current);
     const currentDescription = current.description ? { description: current.description } : {};
     if (current.destroyed) return { state: "completed", ...currentDescription };
     const currentRunning = this.#running.get(forkId);
@@ -234,6 +282,7 @@ export class Controller {
     } catch (error) {
       const settled = project(ctx.sessionManager.getBranch()).get(forkId);
       if (settled?.destroyed && settled.agentId === running.agentId) {
+        this.assertOutcomeRecorded(settled);
         return { state: "completed", ...(settled.description ? { description: settled.description } : {}) };
       }
       throw error;
@@ -297,27 +346,56 @@ export class Controller {
     await this.finalize(ctx, running, "notice", notice, undefined, generation);
   }
 
-  private async finalize(ctx: any, running: Running, kind: Destroyed["kind"], output: string, cursor: string | undefined, generation: number): Promise<void> {
-    if (this.#paused || !this.current(generation, running) || running.finalizing || !this.ownsCurrentBranch(ctx, running)) return;
+  private async finalize(ctx: any, running: Running, kind: Destroyed["kind"], output: string, cursor: string | undefined, generation: number): Promise<boolean> {
+    if (this.#paused || !this.current(generation, running) || running.finalizing || !this.ownsCurrentBranch(ctx, running)) return false;
     running.finalizing = true;
     try {
-      await this.#agents.destroy(running.agent);
+      try {
+        await this.#agents.destroy(running.agent);
+      } catch (error) {
+        throw new Error(`Could not confirm the SDK ended fork ${running.forkId}: ${errorText(error)}`);
+      }
       // session_before_tree waits for work already in the lifecycle queue. Once this
-      // finalization starts on its owning branch, it must record the outcome before
-      // that branch can change.
+      // finalization starts on its owning branch, finish bookkeeping even if the
+      // calling tool is aborted. An abort cannot undo external destruction.
       const destroyed: Destroyed = { type: "fork.destroyed", forkId: running.forkId, agentId: running.agentId, kind, output, cursor };
-      appendDestroyed(this.#pi, destroyed);
+      try {
+        appendDestroyed(this.#pi, destroyed);
+      } catch (error) {
+        // The agent is gone. Do not destroy it again or process late callbacks.
+        const message = `The SDK confirmed fork ${running.forkId} ended, but recording its outcome failed: ${errorText(error)}`;
+        this.#running.delete(running.forkId);
+        this.#recordingFailures.set(running.agentId, { forkId: running.forkId, message });
+        this.#unavailable.set(running.forkId, message);
+        throw new Error(message);
+      }
       this.#running.delete(running.forkId);
-      await this.#delivery.deliver(this.#pi, running.forkId, running.agentId, kind, output, cursor, running.description);
+      this.#unavailable.delete(running.forkId);
+      try {
+        await this.#delivery.deliver(this.#pi, running.forkId, running.agentId, kind, output, cursor, running.description);
+      } catch (error) {
+        throw new Error(`Fork ${running.forkId} ended and its outcome was recorded, but requesting the parent notification failed: ${errorText(error)}`);
+      }
+      return true;
     } finally {
       running.finalizing = false;
     }
   }
 
-  private enqueue(work: () => Promise<void>): Promise<void> {
+  private enqueue<T>(work: () => Promise<T>): Promise<T> {
     const next = this.#lifecycleTail.catch(() => undefined).then(work);
-    this.#lifecycleTail = next.catch(() => undefined);
+    this.#lifecycleTail = next.then(() => undefined, () => undefined);
     return next;
+  }
+
+  private recordingFailure(record: Created): string | undefined {
+    const failure = this.#recordingFailures.get(record.agentId);
+    return failure?.forkId === record.forkId ? failure.message : undefined;
+  }
+
+  private assertOutcomeRecorded(record: Created): void {
+    const failure = this.recordingFailure(record);
+    if (failure) throw new Error(failure);
   }
 
   private activeRecord(ctx: any, forkId: string): Created {

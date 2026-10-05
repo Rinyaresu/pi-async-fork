@@ -1,12 +1,18 @@
 # pi-async-fork specification
 
+## Specification status
+
+This document specifies the approved V2 target before implementation. New creation calls must explicitly choose both role and effort; context has role-dependent defaults. Requirements below are not claims that V2 is already implemented or integration-validated.
+
+The local working tree already contains the uncommitted `cancel_fork` implementation, its tests, and its documentation; the current repository HEAD does not. `src/index.ts` registers it and forwards to `Controller.cancel()` in `src/forks/controller.ts`. V2 must preserve that local cancellation behavior and regression coverage, not assume cancellation is absent or already released.
+
 ## Purpose
 
 `pi-async-fork` makes forks durable, asynchronous context branches.
 
 A main Pi agent creates bounded work and immediately continues. A pi-fleet agent runs the work independently. The extension sends meaningful intermediate reports and the final assistant response back to the parent as steering messages.
 
-The parent remains the orchestrator. Async forks are temporary work branches. They are not user-facing agents, long-lived specialists, or workflow owners.
+The parent remains the orchestrator and owns user intent, scope, approvals, decomposition, sequencing, integration, and final judgment. Async forks are temporary, bounded, one-off work branches. They are not user-facing agents, long-lived specialists, or workflow owners. Greater effort does not transfer authority. Roles are not mandatory pipeline stages: create only the bounded work whose context isolation, useful parallelism, or independent judgment serves the active goal.
 
 ## Behavior change
 
@@ -41,7 +47,7 @@ pi-fleet is the durable runtime for fork agents. It owns agent processes, worker
 ### `create_fork`
 
 ```text
-create_fork(name, task, description, effort?) → fork ID
+create_fork(name, task, description, role, effort, context?) → fork ID
 ```
 
 The agent supplies a short semantic name for the work. The name does not need to be unique. It must contain one or two lowercase words, with one hyphen between two words. Each word contains letters only. The agent must not add a number because the tool appends the generated seven-digit suffix.
@@ -58,9 +64,37 @@ If child-session creation, fleet creation, or initial task delivery fails, the t
 
 The `create_fork` tool description and its `name` parameter description must state all naming rules. They must include the one-or-two-word limit, lowercase letters-only rule, optional single separator, prohibition against agent-supplied numbers, generated suffix behavior, and requirement to use the returned fork ID for later calls.
 
-`effort` accepts `fast`, `balanced`, or `deep`. Choose it from the primary cognitive job and required reasoning depth. Use the lowest effort that can reliably complete the task. Effort changes reasoning depth, not task scope. `fast` is bounded read-only evidence gathering for lookups, codebase exploration, documentation or web research, exact checks, inventories, and source or relationship tracing. It returns facts and does not make final judgments, recommendations, diagnoses, approval or gate decisions, or changes. `balanced` applies bounded judgment or settled execution for review, plan validation, test interpretation, bounded diagnosis, research synthesis, implementation planning, and scoped changes. `deep` applies frontier uncertainty or the hardest reasoning for novel architecture, unclear root causes, conflicting evidence, difficult security or data analysis, complex system behavior, major product decisions, broad blast radius, and hard-to-reverse choices. Fast and balanced forks have less reasoning capability than the coordinating reader. Deep forks have more reasoning capability and use expensive compute. Capability does not change scope, permissions, authority, or ownership. The coordinating reader makes the decision after assessing every report against the active goal. Use deep only when its added reasoning capability is necessary for the outcome. Do not use deep for routine evidence gathering, settled execution, duplicate agreement, or work that balanced can complete reliably. If fast evidence needs judgment, use `balanced`; if it exposes complex uncertainty, use `deep`. The fixed default is `balanced`.
+#### Role, effort, and context
 
-In the Pi TUI, `create_fork` uses one content line: `create_fork [<effort>] <fork ID> · <description>`. Before creation returns the generated ID, it shows `<name>-…`. The expanded view adds the full task under `─── Task ───`. `steer_fork` uses `steer_fork <fork ID>` and adds the full steering message under `─── Message ───` only when expanded. After its result returns, `fork_status` uses `fork_status <fork ID> · <description>: <state>` and shows observed activity only when expanded. Historical calls without a description retain the existing `fork_status <fork ID>: <state>` format. Brackets apply only to the `create_fork` effort. Normal successful result output, usage, cost, and expansion hints remain hidden. Tool errors remain visible. The displayed ID is the public fork ID, not pi-fleet's internal agent UUID.
+`role` and `effort` are required in every new call, at the tool schema and controller boundary. Missing or invalid values are creation errors before child-session or agent side effects. There is no role inference from effort or task text, no effort inference from role, and no silent capacity/cost default. Compatibility applies to historical records and rendering, not new invocations of the old signature.
+
+`role` accepts:
+
+- `investigate`: read-only discovery, analysis, comparison, or diagnosis within the assigned scope. Return evidence, bounded interpretation, and material unknowns; do not implement or modify the investigated work.
+- `execute`: perform only the authorized bounded outcome, including necessary writes and ordinary local decisions. Stop and report ambiguity that changes behavior, architecture, scope, authorization, or the write surface. Do not take over the initiative or expand into adjacent work.
+- `verify`: read-only independent verification of supplied requirements, a result, or a hypothesis. Try to falsify it; do not assume correctness. Return findings and blind spots; do not fix the reviewed work.
+
+Read-only is an instruction contract, not a runtime sandbox or per-tool permission. It prohibits changing the investigated/reviewed work and unauthorized persistent mutations. Necessary temporary validation artifacts and authorized test fixtures are allowed; shared data, services, and external effects still require the applicable authorization. An `execute` role does not itself grant approval for arbitrary writes or external actions. All roles preserve project rules, main ownership, bounded scope, no nested delegation, and no adjacent work.
+
+`effort` accepts `fast`, `balanced`, or `deep` and selects only the corresponding configurable model/thinking profile. The caller must explicitly choose the lowest effort that can reliably complete the result:
+
+- `fast`: straightforward bounded work with little unresolved judgment, including fully specified implementation.
+- `balanced`: ordinary significant judgment or interpretation.
+- `deep`: genuinely difficult unresolved uncertainty where additional reasoning capability can materially change the outcome.
+
+Writing files alone does not justify a stronger model. Effort does not change role, authorization, scope, context, ownership, or write coordination. All nine role/effort combinations are valid, including `execute + fast` and read-only `investigate + deep` or `verify + deep`. Profile names are configurable selectors, not proof of relative model capability or cost versus each other or the main. There is no automatic model routing, escalation, or role change; a worker reports material uncertainty to the main.
+
+`context` accepts `inherit` or `isolated`. It is optional and resolves as follows:
+
+| Role | Omitted context |
+| --- | --- |
+| `investigate` | `inherit` |
+| `execute` | `inherit` |
+| `verify` | `isolated` |
+
+Every role may explicitly override either mode. The extension resolves and persists the effective mode. Context controls parent session-history inheritance only; it does not isolate the worker's system prompt, profile, resources, credentials, tools, environment, filesystem, or external memory. An isolated task must supply the requirements and evidence needed without relying on the parent conversation. Its framing can still bias a verifier; isolation is not proof of independent judgment.
+
+In the Pi TUI, new `create_fork` calls use one content line: `create_fork [<role>/<effort>/<effective context>] <fork ID> · <description>`. Before creation returns the generated ID, it shows `<name>-…`. Omitted context is displayed using its resolved role default. Historical calls without role retain the effort-only format, accepting historical `effort` or `tier` metadata without inferring a role; they are legacy calls, not a newly authorized role. The expanded view adds the full task under `─── Task ───`. `steer_fork` uses `steer_fork <fork ID>` and adds the full steering message under `─── Message ───` only when expanded. After its result returns, `fork_status` uses `fork_status <fork ID> · <description>: <state>` and shows observed activity only when expanded. Historical calls without a description retain the existing `fork_status <fork ID>: <state>` format. Normal successful result output, usage, cost, and expansion hints remain hidden. Tool errors remain visible. The displayed ID is the public fork ID, not pi-fleet's internal agent UUID.
 
 Fork result custom messages retain the model-visible fork-ID prefix `<forkId>:\n\n` followed by a progress, final, or notice sentence and then the report. Progress says `This is an intermediate progress report. The fork is still working and can receive steering.` Final output says `This is the final report. The fork finished and can no longer receive steering. Treat this report as an internal work event. Do not write user-visible text only because it arrived.` A notice says `This is a terminal notice. The fork finished and can no longer receive steering. Treat this notice as an internal work event. Do not write user-visible text only because it arrived.` The description is display metadata only and never changes this envelope.
 
@@ -93,9 +127,25 @@ The tool resolves the fork ID against the current active-branch ledger.
 
 Tool output must not expose the retained child session path or other internal storage paths.
 
-The `fork ID` parameter descriptions for `steer_fork` and `fork_status` must tell the caller to use the complete ID returned by `create_fork`. The caller must not shorten, modify, or reconstruct it.
+The `fork ID` parameter descriptions for `steer_fork`, `fork_status`, and `cancel_fork` must tell the caller to use the complete ID returned by `create_fork`. The caller must not shorten, modify, or reconstruct it.
 
-There is no `destroy_fork` tool.
+### `cancel_fork`
+
+```text
+cancel_fork(fork ID, reason?) → { state: "completed", outcome: "cancelled" | "already_completed" }
+```
+
+The tool explicitly ends a fork owned by the active branch. It validates the branch-scoped fork ID and immutable agent identity, and serializes cancellation in the existing lifecycle queue. It does not require a prior status call and can cancel starting, working, or terminal forks still waiting in the grace period. The first finalization applied in the queue wins, not the first received report candidate. A completed fork returns `already_completed` without another destruction, entry, or notice, preserving its original output.
+
+Cancellation reuses finalization: destroy through the public SDK, append `fork.destroyed` with `kind: "notice"` and `Fork explicitly cancelled.` plus the optional reason, then request the parent notification. It preserves the child session JSONL and leaves the public `fork_status` state as `completed`. Finalization explicitly reports whether it applied or ignored a stale context; a no-op cannot produce cancellation success. A queued cancellation rejects a changed generation or mismatched identity before destruction.
+
+An aborted tool signal prevents destruction when observed before it starts. After destruction starts, the operation finishes recording and notification request even if the tool is aborted, because abort cannot reverse an external action. Session tree transitions drain already-started lifecycle work before switching branch. If a veto or aborted summary left the controller paused without `session_tree`, a subsequent idle context or active agent turn can recover it; a tool call must not clear pause during actual navigation.
+
+Errors distinguish unconfirmed destruction, SDK-confirmed destruction with failed outcome recording, and successful recording with failed notification request. Pi can mutate its in-memory entries before a persistence error, so finding an entry in `getBranch()` does not confirm its successful recording. After a recording failure, the current controller retains the error for the public fork ID and immutable agent ID and drops the stopped handle rather than destroying again or processing late callbacks. That error survives branch reconciliation within the controller: a matching record cannot be restored or replayed, and cancellation and status report the recording failure instead of accepting an in-memory completion. A different agent identity does not inherit it. Transient availability errors continue to be recomputed during reconciliation. Recording-failure knowledge is cleared when the controller stops; this adds no durable recovery mechanism. `pi.sendMessage()` has no acknowledgement, and only synchronous request failures can reach this tool; asynchronous notification failures are outside its success guarantee.
+
+The tool does not roll back files or other effects and does not promise immediate interruption or the termination of external jobs, escaped processes, or subprocesses created by custom tools. It uses the SDK's child Pi shutdown. Actual native-shell cleanup depends on the Pi runtime and requires integration testing.
+
+In the TUI, the collapsed call is `cancel_fork <fork ID>: <outcome>` after success and `cancel_fork <fork ID>` while pending. Expanded output adds an optional reason under `─── Reason ───`. Errors remain visible. There is no `destroy_fork` tool or cancellation UI command.
 
 ## Fork ID
 
@@ -193,26 +243,57 @@ All report delivery must serialize. Several progress or final reports can arrive
 
 ## Session and context model
 
-Each fork receives a retained child Pi session derived from the parent session's active branch.
+Every fork receives its own retained child Pi session with a fresh session ID and `parentSession` referencing the actual parent path. Parent and child must never append to the same writable JSONL. Retain the child after fleet destruction, including cancellation; remove only an unregistered session during failed creation cleanup.
 
-The child session file must:
+The current `toolCallId` must identify the invoking assistant entry in the active branch in both modes. Missing invocation or parent path is a clear creation error; never fall back to an active leaf with an unresolved tool batch. Sibling calls use the same cut, not another child's session.
 
-- have a fresh session ID;
-- reference the parent session path;
-- contain the parent header and active branch context needed by the child;
-- remain available after the fleet agent is destroyed so completed fork work can be inspected later.
+### `inherit`
 
-The session cut is the assistant entry that contains the current `create_fork` tool call. The extension finds that entry by the current `toolCallId`. It copies all earlier active-branch entries unchanged and excludes every later parent entry.
+Preserve the existing projection: derive the child header from the parent with a fresh session ID and lineage; copy earlier active-branch entries up to the invoking assistant, excluding all later entries. Cloning history may include system checkpoints, compactions, summaries, context edits, and tool results, not just user text.
 
-The extension clones the invoking assistant entry and removes every `toolCall` content block, including sibling tool calls from the same assistant batch. It preserves remaining `thinking` and `text` blocks in their original order and changes `stopReason` from `toolUse` to `stop`. It keeps a thinking-only cleaned entry and omits the cleaned entry only when no content remains.
+Clone the invoking assistant entry and remove every `toolCall` block, including sibling calls from the same batch. Preserve remaining thinking and text in order and change `toolUse` to `stop`. Retain a thinking-only cleaned entry; omit only an empty cleaned entry. Append the child marker linked to the cleaned entry, or the invoking entry's parent if cleaning removed all content.
 
-After that cleaned entry, the extension adds a `pi-async-fork-child` custom entry containing version `1`, the fresh child session ID, and the public fork ID. The marker links to the cleaned entry, or to the invoking entry's parent when cleaning removed all content. The marker is extension state and does not enter model context. A matching marker and session-header ID identify an async child across restart and branch navigation. Copied markers for other session IDs do not identify the current session.
+Keep the current synthetic assistant boundary representation for this path, linked after the marker with a fresh entry ID, zero usage, no source response ID or reasoning signature, and `stopReason: "stop"`. Its content is the V2 common boundary plus inherited-context framing and the selected role contract. It must not treat previous assistant actions or requests as the child's own work or active task.
 
-The extension always adds a synthetic assistant boundary with a new entry ID after the marker. The boundary links to the marker. It reuses only the source provider, API, and model metadata, has zero usage, has no `responseId` or reasoning signature, and uses `stopReason: "stop"`. Its static text starts with the assistant-role runtime declaration `I am a fork.`, frames earlier messages as main-agent context, commits the worker to the next user task, requires it to stay within scope and report out-of-scope findings without acting on them, explicitly prohibits `create_fork`, `fork_status`, `steer_fork`, and other delegation tools even when available, and contains the two-section report contract. It also prohibits any tool or action that defers work to a later run, future wake-up, passive wait, or background continuation. This rule is capability-based and does not depend on tool names. Normal tools that return during the current run remain allowed. The fork ID appears at the end of the boundary so sibling forks can share the longest input prefix.
+### `isolated`
 
-The extension must return a clear creation error if it cannot find the current `toolCallId`. It must not fall back to copying the active leaf because that leaf can contain an unresolved tool batch.
+Construct a new native session in memory rather than projecting the parent branch:
 
-The child must never share the writable parent JSONL session file. Parent and child Pi processes must not append to the same session. Destroying a fleet agent must not delete its retained Pi session file.
+```ts
+// Construction algorithm; not an assertion of completed implementation.
+const child = SessionManager.inMemory(cwd, { parentSession: parentPath });
+const sessionId = child.getHeader().id;
+child.appendCustomEntry("pi-async-fork-child", {
+  version: 1, sessionId, forkId,
+});
+child.appendCustomMessageEntry(
+  "pi-async-fork-boundary",
+  buildForkBoundary(forkId, role, "isolated"),
+  false,
+);
+// mkdir async-forks as needed; serialize header and entries as JSONL.
+await writeFile(childPath, serializeJsonl([
+  child.getHeader(), ...child.getEntries(),
+]), { mode: 0o600, flag: "wx" });
+```
+
+Keep the current path shape `<parent session directory>/async-forks/<sessionId>.jsonl`. Use the native in-memory header and entry IDs/links, then the existing exclusive secure writer. Do not use persistent `SessionManager.create()` followed by chmod: its initial permission depends on umask, and chmod afterward leaves a permission window. Do not alter process-global umask.
+
+The initial isolated file contains only the new header, root child marker, and new boundary `custom_message`. It contains no parent messages, thinking, checkpoints, compactions, context edits, branch summaries, response metadata, or invoking-assistant clone. The custom boundary needs no provider/model/usage metadata. `display: false` hides it from normal UI, not from model context; Pi converts custom-message content to user context. The assigned task is delivered separately through the existing `agent.send()` flow.
+
+Do not copy or fabricate a system checkpoint in the host. Pi must load the worker's own profile/resources and declare its current system/tools during initialization of the first request, including when that checkpoint follows the initial boundary in persisted entry order.
+
+`parentSession` is lineage metadata, not a history-import instruction. Preserve it. Acceptance requires demonstrating no indirect parent-history recovery on the real worker path while the link remains intact and the parent file remains present and readable; inspecting the initial JSONL alone is insufficient.
+
+### Marker and prompt composition
+
+Both modes retain the `pi-async-fork-child` custom marker with version `1`, fresh child session ID, and public fork ID. The marker is extension state outside model context. Detection uses all entries and requires the marker session ID to match the header; copied ancestor markers do not identify a new session.
+
+Compose boundary content as common ownership/one-off rules + context framing + a small role contract + the existing report contract. Do not duplicate the entire prompt per role. The exact identity prefix is `I am a fork. I am not the main agent.` In inherit framing, earlier conversation belongs to the main; in isolated framing, the prior conversation was not supplied and the explicit task/evidence is the available conversational basis. Do not claim inherited context exists in isolated mode.
+
+The common boundary commits the worker to the assigned task, bounded scope, no adjacent work, and reporting material ambiguity. Explicitly prohibit `create_fork`, `fork_status`, `steer_fork`, `cancel_fork`, shell/CLI delegation, and other delegation tools even when available. Preserve the two-section `Output`/`Learnings` report protocol and prohibition on deferring completion to later runs, future wake-ups, passive waits, or background continuations. This prohibition is capability-based, not tool-name-based; ordinary tools returning in the current run remain allowed. Keep the fork ID at the end of the boundary.
+
+History isolation does not change `cwd`, `agentDir`, env, permissions, resources, or external memory availability. The same project/profile can supply instructions in either mode.
 
 ## Parent-session ledger
 
@@ -225,7 +306,11 @@ fork.created
 fork.destroyed
 ```
 
-`fork.created` is appended only after pi-fleet creates the agent and `agent.send()` accepts the initial task. It records the fork ID, pi-fleet name, immutable pi-fleet agent ID, selected state directory, child session path, selected effort, and description. The description remains optional when parsing historical records. Historical records can include `triggerTurn`; the parser accepts and ignores it.
+`fork.created` is appended only after pi-fleet creates the agent and `agent.send()` accepts the initial task. It records the fork ID, pi-fleet name, immutable pi-fleet agent ID, selected state directory, child session path, selected effort under the existing required `tier` field, effective `role`, effective `context`, and description. Persist resolved context even when omitted by the caller. Do not duplicate `tier` as another ledger `effort` field.
+
+The parser retains its required valid `tier` contract and accepts historical records without role/context. Missing historical role means unknown/legacy, never inferred from tier or task. Missing historical context means `inherit`, matching the former session construction. Description remains optional for old records; legacy `triggerTurn` is accepted and ignored. Validate new fields when present; malformed values are not silently treated as historical absence.
+
+Do not migrate old ledger entries or child session files, infer historical roles, retrofit new prompts into restored workers, or change their selected model. Historical parse/render compatibility does not permit new creation calls missing role or effort.
 
 `fork.destroyed` is appended only after pi-fleet destruction succeeds. It identifies the same fork and immutable agent ID, and stores the final output or situation notice, its kind, and the pi-fleet cursor when available for parent-delivery replay.
 
@@ -233,7 +318,7 @@ The extension rebuilds the fork ledger by reading relevant custom entries from r
 
 Fork records on inactive or sibling session branches are not part of the current projection. Historical completed records remain available to `fork_status`, but their internal child session paths are not returned through tool output.
 
-Normal tool failures return errors directly. The first version does not add intent/outcome records, a transactional workflow engine, or a second state database. A crash between an external pi-fleet action and its session entry can leave an orphan or stale record. Recovery handles that case through status and identity checks.
+Normal tool failures return errors directly. V2 does not add intent/outcome records, a transactional workflow engine, or a second state database. A crash between an external pi-fleet action and its session entry can leave an orphan or stale record. Recovery handles that case through status and identity checks.
 
 ## Restart and lifecycle behavior
 
@@ -246,6 +331,8 @@ On `session_start`, the extension:
 5. Checks status so pi-fleet can recover a missing worker and determine settlement or a no-result condition.
 6. Restarts report receivers for active forks.
 7. Resends missing progress or completed `fork.destroyed` reports only when parent custom-message metadata has no match.
+
+Restoration uses the recorded agent name and immutable ID, not a new profile selection from tier/role/context. Role/context are persisted contract and display metadata; they do not cause session reconstruction or a prompt retrofit. Existing workers retain their original session and runtime configuration.
 
 On `session_shutdown`, the extension stops receivers and closes its SDK client. It does not destroy active pi-fleet agents.
 
@@ -291,7 +378,7 @@ The configuration has five concepts only:
 
 `PATH` and `PI_CODING_AGENT_DIR` are reserved. Environment names must be non-empty and cannot contain `=` or a null byte. Values must be strings without null bytes. Empty string values are valid. Do not use `env` for secrets: pi-fleet persists values in agent state and backups, and child processes can expose them in logs or activity.
 
-The selected profile maps to Pi model flags when the agent is created. The resolved `env` map passes only to that Pi child. Pi-fleet persists it through Pi and worker recovery. Existing forks retain their immutable recorded map until destruction, so configuration changes affect only new forks. pi-async-fork does not duplicate this map in its session ledger. A missing or invalid selected profile leaves the auto-discovered extension inactive and makes all three tools return the same configuration error. It must not fail Pi session startup. Reload or restart Pi after adding valid configuration.
+The explicitly required effort alone selects a profile and maps it to Pi model flags when the agent is created. Role and context must not select, alter, or validate profiles differently. The three profiles and all existing settings/merge rules remain unchanged; V2 introduces no role profiles, effort default setting, or automatic model-routing configuration. The resolved `env` map passes only to that Pi child. Pi-fleet persists it through Pi and worker recovery. Existing forks retain their immutable recorded map until destruction, so configuration changes affect only new forks. pi-async-fork does not duplicate this map in its session ledger. A missing or invalid selected profile leaves the auto-discovered extension inactive and makes all four tools return the same configuration error. It must not fail Pi session startup. Reload or restart Pi after adding valid configuration.
 
 Global and project settings both apply. Project scalar settings replace global values. A project `null` for `agentDir` or `stateDir` explicitly selects the corresponding Pi or pi-fleet default. A project effort profile replaces the matching global profile as one complete profile. Project `env` objects merge by key with global values: a project string overrides one value, a project key set to `null` removes one inherited value, `env: null` clears all inherited values, and `env: {}` retains inherited values. Omitted or empty resolved maps pass no SDK overlay.
 
@@ -301,11 +388,27 @@ Pi's default agent directory is `~/.pi/agent`. `PI_CODING_AGENT_DIR` selects ano
 
 When configured, the fork `agentDir` is the complete worker-profile boundary. It can contain its own `settings.json`, `SYSTEM.md`, `AGENTS.md`, extensions, skills, prompts, themes, model definitions, package resources, and credentials policy. When it is omitted or `null`, pi-fleet starts the worker with Pi's default agent directory instead. When `stateDir` is omitted or `null`, the extension omits the SDK option and pi-fleet uses `~/.pi-fleet`.
 
-The profile controls stable resources and extensions. It does not contain fork-specific identity, bounded-worker instructions, task text, or report instructions. The extension adds identity, context framing, and the full report contract in a synthetic assistant boundary at the child-session tail. The next user message contains the unchanged assigned task followed by a concise requirement for the exact `Output` and `Learnings` headings. This dynamic message does not change the stable system and inherited-history prefix.
+The profile controls stable resources and extensions. It does not contain fork-specific identity, role contract, task text, or report instructions. The extension adds identity, context framing, role contract, and the common report contract in a boundary at the child-session tail: synthetic assistant for inherit, native custom message for isolated. The next user message contains the unchanged assigned task followed by the progress protocol and concise requirement for the exact `Output` and `Learnings` headings. Profile/system resources remain independent of history mode.
 
-`pi-async-fork` does not maintain an extension allowlist or pass individual extension flags to child Pi processes. The selected profile determines the fork's extension set. If the profile loads `pi-async-fork` inside a marked child session, the extension does not start its controller and all three async-fork tools return a task-focused child-session error. `Controller.create()` repeats the guard for future internal call paths.
+`pi-async-fork` does not maintain an extension allowlist or pass individual extension flags to child Pi processes. The selected profile determines the fork's extension set. If the profile loads `pi-async-fork` inside a marked child session, the extension does not start its controller and all four async-fork tools return a task-focused child-session error. `Controller.create()` and `Controller.cancel()` repeat the guard for internal call paths.
 
 Project-local `<cwd>/.pi` resources remain separate from the selected global agent directory. The fork profile's trust policy decides whether non-interactive Pi loads those project resources. Root and ancestor `AGENTS.md` context remains a Pi concern.
+
+## Runtime guarantees and instruction contracts
+
+Runtime must validate required role/effort and optional context before side effects, resolve context defaults, select the profile solely by effort, persist effective metadata, construct the correct session mode, and maintain the session-ID marker and this extension's child-tool guard. Preserve existing branch/identity/generation checks and lifecycle semantics.
+
+Read-only, main ownership, bounded scope, no adjacent work, no indirect shell/CLI delegation, and ambiguity handling are prompt/task contracts. No universal tool guard or OS permission guarantee enforces them in V2. Removing edit/write tools would not make bash/custom tools read-only and is out of scope. Context isolation does not create a filesystem/security boundary. The lifecycle queue does not serialize worker execution or prove disjoint write surfaces.
+
+## Coordinated instruction migration
+
+Update the extension schema/descriptions, role/context prompts, README, tests, and the active `/home/kaique/.pi/agent/APPEND_SYSTEM.md` as one coherent V2 delivery. Do not leave a final configuration where the extension allows `execute + fast` but the loaded system prohibits fast implementation. Replace conflicting rules; merely appending V2 guidance is insufficient.
+
+In APPEND_SYSTEM, remove fast = read-only, implementation = balanced, automatic evidence/judgment/implementation escalation by effort, and assumptions of capability relative to the main. Select role from work/authorization, effort from remaining reasoning uncertainty, and context from useful history versus anchoring. Update task contracts, speculative investigation, memory/context framing, and role-based write coordination. Preserve main ownership, bounded one-off work, fork-first without ceremony, no duplicate work, event-driven async delivery, no idle polling, no nested/adjacent work, and existing project authorization. Include `cancel_fork` in prohibited child operations.
+
+Any retained effort-specific concurrency ceilings are resource/cost budgets only, not write-safety rules. Remove unlimited fast concurrency justified by read-only. Do not add an obligatory investigate → execute → verify pipeline or automated model escalation.
+
+Pi can load a different agentDir or a trusted project APPEND_SYSTEM instead of the global append; project and global append are not necessarily combined. Verify the actually selected instruction sources for the supported worker profile, and document that external profiles carrying old routing rules must also be updated. Isolated history still loads those profile instructions.
 
 ## pi-fleet dependency
 
@@ -336,49 +439,59 @@ src/
     session.ts
     agent.ts
     delivery.ts
+    render.ts
     task-prompt.ts
 
 test/
-  configuration.test.mjs
+  index.test.ts
+  configuration.test.ts
   forks/
-    controller.test.mjs
-    identity.test.mjs
-    ledger.test.mjs
-    session.test.mjs
-    agent.test.mjs
-    delivery.test.mjs
-    task-prompt.test.mjs
+    controller.test.ts
+    identity.test.ts
+    ledger.test.ts
+    session.test.ts
+    agent.test.ts
+    delivery.test.ts
+    render.test.ts
+    task-prompt.test.ts
+  integration/
+    isolated-context.mjs
 ```
 
 The `forks/` directory is one cohesive feature boundary. Its files use that directory context instead of repeating a `fork-` prefix.
 
-- `index.ts` registers Pi tools and lifecycle hooks. It creates and stops the session-scoped controller and contains no fork behavior.
+- `index.ts` registers Pi tools and lifecycle hooks, requires role and effort in the creation schema, describes independent role/effort/context semantics, and forwards creation options. It creates and stops the session-scoped controller without implementing fork lifecycle behavior.
 - `configuration.ts` loads and validates `agentDir`, `stateDir`, `env`, and the three effort profiles. Configuration types remain with this module.
-- `forks/controller.ts` coordinates accepted creation, steer, status, restoration, branch protection, ordered report classification, settlement, situation notices, and finalization. It owns current in-memory fork state and the session generation guard, but no low-level storage, SDK, or message-formatting logic.
+- `forks/controller.ts` validates/resolves creation options, selects profiles only by explicit effort, passes role/context into session construction, and persists effective metadata. It coordinates accepted creation, steer, status, explicit cancellation, restoration, branch protection, ordered report classification, settlement, situation notices, and finalization. It owns current in-memory fork state and the session generation guard, but no low-level storage, SDK, or message-formatting logic.
 - `forks/identity.ts` owns name validation, seven-digit suffix generation, ID formatting, and collision attempts.
 - `forks/ledger.ts` owns `fork.created` and `fork.destroyed` entry shapes, active-branch projection, historical lookup, lifecycle writes, and replayable output records.
-- `forks/session.ts` owns the current tool-call cut, invoking-assistant projection, durable child-session marker and detection, linked synthetic assistant boundary entry, retained child JSONL creation, and unregistered-session cleanup after creation failure.
+- `forks/session.ts` owns invocation validation, inherited projection, native isolated construction, child-session marker/detection, mode-appropriate boundary entries, secure retained JSONL creation, and unregistered-session cleanup after creation failure.
 - `forks/agent.ts` is the only module that imports the public pi-fleet SDK. It owns client lifetime, agent creation and restoration, status monitoring, ordered activity receivers, serialized steering, and destruction.
 - `forks/delivery.ts` is the only module that calls `pi.sendMessage()`. It owns serialized parent progress, final, and notice delivery, model-visible envelopes, display metadata, and replay detection.
 - `forks/render.ts` owns the async-fork TUI rendering. It transfers returned fork IDs and states through Pi's row-local renderer state, updates its retained call components directly without reentrant invalidation, hides normal successful fork output, and renders observed activity only in expanded successful `fork_status` output.
-- `forks/task-prompt.ts` owns the synthetic assistant boundary text, including identity, inherited-context framing, bounded-worker instructions, milestone-report protocol, and the full `Output` and `Learnings` report contract. It also owns the assigned-task user message, its evidence-, state-, novelty-, and brevity-gated progress-report requirement, and its concise final-response format requirement.
+- `forks/task-prompt.ts` owns common boundary text, context framing, small role contracts, bounded-worker instructions, milestone-report protocol, and the full `Output` and `Learnings` report contract. It also owns the assigned-task user message, its evidence-, state-, novelty-, and brevity-gated progress-report requirement, and its concise final-response format requirement.
+- `test/integration/isolated-context.mjs` exercises actual registered creation and real Pi/fleet workers against a local recording provider; it proves effective-context isolation, not just file construction. A main process must execute it because it creates agents; a bounded child may prepare it but must not bypass the no-nested-delegation rule to run it.
 
-Types remain with the module that owns their meaning. The first version has no generic `utils`, `helpers`, `models`, `constants`, shared-code directory, repository abstraction, generic pi-fleet wrapper, custom database, cost footer, subprocess runner, JSONL event parser, or copied `pi-fork` architecture.
+Types remain with the module that owns their meaning. V2 has no generic `utils`, `helpers`, `models`, `constants`, shared-code directory, repository abstraction, generic pi-fleet wrapper, custom database, cost footer, subprocess runner, JSONL event parser, or copied `pi-fork` architecture.
 
 ## Scope and non-goals
 
-The extension does not provide workspace isolation. Fork agents share the project working directory, so the extension does not claim that concurrent writes are safe. The caller and harness policy remain responsible for write coordination.
+The extension does not provide workspace isolation. Fork agents share the project working directory, so the extension does not claim that concurrent writes are safe. The main/caller and harness policy remain responsible for write coordination, including the main's own writes.
+
+Coordinate by work and role, not effort: serialize `execute` forks by default regardless of model. Parallel execution requires known disjoint write surfaces and relevant shared resources. Independently bounded `investigate`/`verify` work may run concurrently only without conflicting effects. Read-only tests can still contend for databases, caches, ports, and services; isolated conversation does not remove those conflicts.
 
 It does not include:
 
 - long-lived specialized agents;
 - user-facing agent management;
 - recursive async forks;
-- fork destruction tools;
 - a custom database or job engine;
 - cost footer or cost aggregation;
 - direct imports from `pi-fork` internals;
-- exactly-once parent-result delivery guarantees.
+- exactly-once parent-result delivery guarantees;
+- `write_scope`, locks, a new scheduler, or workspace/security sandbox;
+- per-tool role permissions;
+- a mandatory role pipeline, automatic model routing, or autonomous escalation.
 
 Synchronous `pi-fork` remains separate and active.
 
@@ -386,10 +499,10 @@ Synchronous `pi-fork` remains separate and active.
 
 Before daily use, prove:
 
-1. A child receives a distinct retained session containing the intended parent active-branch context.
-2. The child projection removes all tool calls from the invoking assistant entry, preserves ordered text and thinking, changes `toolUse` to `stop`, and includes no synthetic missing-tool results.
-3. A thinking-only cleaned invoking assistant is retained. An empty cleaned entry is omitted. Both paths add a `pi-async-fork-child` custom marker linked before the synthetic assistant boundary, while a missing current `toolCallId` returns a creation error.
-4. The marker contains version `1`, the current child session ID, and the public fork ID. Detection uses all session entries but accepts only a marker matching the current session-header ID. The boundary links to the marker and has a distinct ID, zero usage, no source response ID or reasoning signature, stable context framing and report text, and the fork ID at its end.
+1. Each child receives a distinct retained session with correct lineage and secure `0600` initial permissions. Inherit receives the intended active-branch cut; isolated receives only a fresh header, root marker, and native custom boundary before task delivery.
+2. Inherit projection removes all invoking tool calls, preserves ordered text and thinking, changes `toolUse` to `stop`, and creates no synthetic missing-tool results. Isolated does not copy any invoking-assistant metadata or parent context-producing entries.
+3. Inherit retains a thinking-only cleaned assistant and omits an empty one. Both modes place a valid child marker before their boundary, and reject a missing current `toolCallId`.
+4. The marker contains version `1`, current child session ID, and public fork ID. Detection uses all entries but only matching header IDs. Boundaries link after the marker with distinct IDs and the fork ID at the end. The inherited assistant boundary has zero usage and no source response ID or reasoning signature; the isolated `custom_message` needs none of that assistant metadata and participates in context despite `display: false`.
 5. Multiple `create_fork` calls from one assistant batch produce sibling sessions from the same cut point.
 6. `create_fork` creates the child session and fleet agent, starts reception, sends the assigned task followed by the evidence-, state-, novelty-, and brevity-gated progress-report requirement and concise final-response format requirement as user content, receives initial-task acceptance, appends `fork.created`, and returns before the child completes.
 7. Initial creation or task-send failures destroy any created agent, remove the unregistered child session, write no ledger entry, return a clear error, and report cleanup failure when it occurs. Uncertain sends are not retried.
@@ -405,18 +518,44 @@ Before daily use, prove:
 17. Machine or worker recovery preserves the configured `agentDir` profile, or continues with the default profile when no `agentDir` is configured.
 18. Name reuse with a different immutable pi-fleet agent ID is detected and never adopted.
 19. Parent session replacement or branch change prevents stale receiver delivery.
-20. The synthetic assistant boundary starts with the exact assistant-role runtime declaration `I am a fork.`, identifies the worker as a fork rather than the main agent, assigns inherited assistant messages to the main agent, marks inherited requests inactive, requires the worker to stay within scope and report out-of-scope findings without acting on them, explicitly prohibits `create_fork`, `fork_status`, `steer_fork`, and other delegation tools even when available, prohibits capability-equivalent deferred completion or later-run tooling without relying on names, defines the two-section checkpoint contract and same-response next-tool-call rule, and contains the two-section report contract. The next user message contains the assigned task followed by an evidence-, state-, novelty-, and brevity-gated progress-report requirement and a concise requirement to use both exact final-report headings, including for one-line tasks.
-21. A marked child does not start an async-fork controller. All three public async-fork tools reject calls with the same task-focused error, and direct `Controller.create()` calls reject before child-session or agent creation.
+20. Both boundary modes start with `I am a fork. I am not the main agent.`, preserve the common one-off identity/scope/report rules, prohibit all four async-fork tools and indirect delegation, and prohibit capability-equivalent deferred completion without relying on tool names. Context framing differs correctly: inherit assigns previous conversation to the main and marks prior requests inactive; isolated does not claim to have received that conversation. Role contracts allow bounded `execute + fast` implementation, keep investigate/verify read-only at any effort, and require reporting material ambiguity. Preserve the two-section checkpoint/final report contract and same-response next-tool-call rule. The assigned user task retains the evidence-, state-, novelty-, and brevity-gated progress requirement and both exact final headings even for one-line tasks.
+21. A marked child does not start an async-fork controller. All four public async-fork tools reject calls with the same task-focused error. Direct `Controller.create()` and `Controller.cancel()` calls repeat the guard before lifecycle work.
 22. Fork names enforce the one-or-two-word rule in the tool and parameter descriptions, reject agent-supplied numbers, and produce IDs with exactly seven generated digits.
 23. Fork IDs avoid current-branch history collisions and retry pi-fleet name collisions.
 24. `create_fork` requires a single-line 3-to-6-word description, trims valid outer whitespace, rejects C0/C1 controls and `U+2028` or `U+2029`, validates it before side effects, and persists it in new `fork.created` records. Historical records without a description remain valid.
-25. The collapsed `create_fork` TUI call is one content line with its effort, public fork ID, and description, while the pending state uses `<name>-…`. The expanded view adds only the full task. Progress, final, and notice headers append the description after the public ID. `steer_fork` and `fork_status` use their exact tool names as headers, the steering message appears only when expanded, and status appends its state and description after a result. Active status activity appears only in expanded status output. Historical entries without descriptions retain current headers. Normal successful result output, usage, cost, and expansion hints remain hidden, while tool errors remain visible.
+25. The collapsed new `create_fork` call displays role, explicit effort, effective context, public ID, and description on one line; the pending state uses `<name>-…`. Historical effort/tier-only calls remain renderable without an invented role, and old entries without descriptions retain their headers. Expanded creation adds only the full task. Progress/final/notice headers retain their description, steer message appears only expanded, and status displays its state/description with activity only expanded. Normal successful output/usage/cost/expansion hints stay hidden; errors remain visible.
 26. Result custom-message content includes the fork-ID prefix and an explicit progress, final, or notice sentence for model context. The description appears only in display metadata. The TUI renderer shows `working` for progress, `completed` for final output, and `terminal` with a warning for notices. It shows Markdown output only in Pi's global expanded mode and never shows internal agent IDs, cursors, or the model-only sentence.
 27. Progress never wakes you. Final reports and terminal notices always wake you when idle or queue steering during active work, including restored and replayed legacy records with `triggerTurn: false`. New records omit `triggerTurn`; historical parsing accepts and ignores it. Terminal model context instructs you to process the report internally without user-visible acknowledgment unless communication is material.
 28. The extension does not imply workspace isolation or safe concurrent writes.
 29. Environment configuration merges global and project values by the documented key rules, rejects reserved or invalid entries, reaches only new child Pi processes, and preserves empty strings. It is absent from the async-fork ledger, while pi-fleet persists and recovers it.
 
-Use unit tests with a fake pi-fleet SDK and isolated real Pi plus pi-fleet integration tests. Unit tests alone cannot prove RPC startup, agent-directory selection, session loading, steering delivery, or recovery.
+30. Explicit cancellation destroys exactly once, records a notice and requests notification only after destruction succeeds, and preserves the retained child session. Repeated calls and both completion/cancellation queue orders retain one outcome. Late callbacks cannot overwrite cancellation. Invalid branches, mismatched identities, stale contexts and active navigation cannot destroy an agent. A pause left by vetoed or aborted navigation can recover safely. Abort before destruction has no effect; abort during destruction does not abandon bookkeeping. Destruction, recording (including in-memory mutation before error), and notification-request failures are distinguishable. A recorded cancellation can replay a missing notification without another destruction.
+31. A real worker in an isolated test environment running a harmless native shell command can be cancelled through the registered tool. Verify worker and tracked-shell termination, retained JSONL, cancellation notice, repeated cancellation, and completed status without assuming external side effects were undone. Retain existing cancellation tests and behavior across V2 rather than substituting role/context tests for them.
+32. New calls reject absent/invalid role or effort before side effects. Test all nine role/effort combinations and both context overrides for every role; verify context defaults and profile selection independent of role/context. There is no silent effort default or inferred role.
+33. Ledger tests preserve required `tier`, parse historical absent role as unknown/legacy and absent context as inherit, reject invalid present fields, and persist new effective role/context. Restore old and new forks by immutable agent identity without profile reselection, historical mutation, or prompt retrofit.
+34. The effective-context integration gate below passes with real worker initialization. Initial JSONL inspection or unit projections alone cannot approve isolated.
+35. Extension descriptions, role/context boundary tests, README, and the actually loaded APPEND_SYSTEM agree: execute + fast is permitted within authorization, and investigate/verify remain read-only contracts at every effort. No stale fast-read-only or implementation-balanced routing remains in the supported profile.
+
+Use unit tests with a fake pi-fleet SDK and isolated real Pi plus pi-fleet integration tests. Unit tests alone cannot prove RPC startup, agent-directory selection, session loading, steering delivery, recovery, or the absence of indirect context import.
+
+### Decisive isolated-context integration gate
+
+Do not declare isolated complete until the real registered tool → child file → fleet → Pi → provider path proves history isolation. Execute workers in a disposable profile/cwd/private fleet with a deterministic OpenAI-compatible loopback endpoint and dummy credentials; do not use personal credentials or provider quota. Disable automatic compaction, retry, cache warming, and unrelated network/resource loading so assertions are attributable to the test.
+
+Record both surfaces without changing context:
+
+- the effective worker transcript before provider conversion, including system and tools (`context_with_system` on Pi versions supporting it);
+- the actual HTTP request received by the loopback provider through Pi's real adapter.
+
+Use fixtures built with the tested Pi version's native entries and unique sentinels present only in parent history, never in task, settings, environment, or shared instruction files. Cover user/assistant/tool-result messages, assistant thinking and invoking-assistant remnants, compaction summaries, retained messages, context-edit replacements, branch summaries, system updates, and compaction/system checkpoints where that version supports them. Include parent raw-history sentinels discarded by compaction/editing as negative probes, but distinguish them from sentinels actually effective in parent context.
+
+Run paired inherit and isolated forks against the same fixture with identical role/effort, e.g. verify/fast, and explicit context mode. Correlate captures by child session ID and a task nonce, not sentinel text in the task. Inherit is the positive control for effective conversational sentinels, summaries, edits, and supported thinking. Verify fixture projection first; an inactive or discarded fixture entry is not a valid positive control. Configure thinking replay supported by the adapter, e.g. `reasoning_content` for the local OpenAI-compatible fixture. A parent checkpoint may be replaced by the worker's current system before transmission; record that normal transformation rather than demand an impossible wire-positive checkpoint.
+
+For isolated, assert absence of every parent sentinel in both effective transcript and provider wire request. Positively assert worker boundary, assigned task/nonce, and worker-only system instruction so empty, failed, or miscorrelated captures cannot pass. Confirm successful provider completion, valid child marker, and `header.parentSession` equal to the actual parent path. Keep that parent file present and readable throughout; do not hide/delete it or sever lineage to make the test pass. Any import via parentSession is a gate failure. Preserve sanitized evidence, tested versions/capabilities, coverage and non-applicable categories, and private-fleet cleanup results.
+
+Version handling must be explicit: declared Pi minimum is 0.85.0; the inspected checkout resolves 0.85.1, and the inspected global runtime is 1.0.1. The inspected 0.85.1 lacks `context_with_system` and context-edit APIs; use its supported conversational `context` event plus actual wire capture and supported fixtures, without pretending modern cases were exercised. Run the full transcript/system/context-edit/checkpoint coverage on 1.0.1. Validate the declared 0.85.0 minimum separately before claiming support, and document any version-specific unavailable observation. Native in-memory construction checks on 0.85.1/1.0.1 do not substitute for these real-worker tests.
+
+This gate proves effective session-history isolation with retained lineage on the tested versions. It does not prove filesystem isolation, read-only enforcement, model quality, unbiased verification, or human TUI behavior.
 
 ## Known limits and open details
 
@@ -425,7 +564,7 @@ Use unit tests with a fake pi-fleet SDK and isolated real Pi plus pi-fleet integ
 - `pi.sendMessage()` has no delivery acknowledgement. A queued progress report can be lost if the parent exits before Pi consumes and persists it. Cursor duplicate suppression applies only after the parent custom message exists.
 - `steer_fork` checks status before adaptive delivery, but pi-fleet does not make that check and send atomic. A fork can become idle within that small interval.
 - pi-fleet currently defines `failed` publicly but may not assign it in all failure paths. The extension forwards raw returned states and handles any returned `failed` as a no-result condition.
-- Pi and pi-fleet do not share an atomic transaction. The first version accepts rare stale or orphan records and reconciles them conservatively. A failed initial cleanup can still leave an unregistered external agent or child session.
+- Pi and pi-fleet do not share an atomic transaction. V2 retains the existing handling of rare stale or orphan records and reconciles them conservatively. A failed initial cleanup can still leave an unregistered external agent or child session.
 - Pi branch navigation has restart semantics that need integration testing for a branch-scoped fork inventory.
 - The child-session file location, custom-entry renderer, and exact status response schema remain implementation details.
 - The child-session marker blocks this extension's tools. It does not block direct pi-fleet CLI commands through a shell; stronger command isolation requires a restricted profile or sandbox.

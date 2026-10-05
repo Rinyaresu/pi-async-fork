@@ -25,6 +25,7 @@ async function loadRenderer() {
   `);
   const source = await readFile(join(process.cwd(), "src/forks/render.ts"), "utf8");
   await writeFile(join(directory, "identity.ts"), await readFile(join(process.cwd(), "src/forks/identity.ts"), "utf8"));
+  await writeFile(join(directory, "task-prompt.ts"), await readFile(join(process.cwd(), "src/forks/task-prompt.ts"), "utf8"));
   await writeFile(
     join(directory, "render.ts"),
     source
@@ -49,6 +50,25 @@ function text(component: any): string {
   if (typeof component?.text === "string") return component.text;
   return Array.isArray(component?.children) ? component.children.map(text).filter(Boolean).join("\n") : "";
 }
+
+test("renders explicit roles with effective context and does not invent missing effort", async () => {
+  const { renderer, cleanup } = await loadRenderer();
+  try {
+    for (const role of ["investigate", "execute", "verify"]) {
+      const mode = role === "verify" ? "isolated" : "inherit";
+      const args = { name: "review", role, effort: "fast" };
+      const state = {};
+      const pending = renderer.renderCreateForkCall(args, theme(), { state });
+      assert.equal(text(pending), `create_fork [${role}/fast/${mode}] review-…`);
+      renderer.renderCreateForkResult({ content: [], details: { forkId: "review-1234567" } }, { expanded: false }, theme(), { state, args, isError: false });
+      assert.equal(text(pending), `create_fork [${role}/fast/${mode}] review-1234567`);
+      assert.equal(text(renderer.renderCreateForkCall({ ...args, context: mode === "inherit" ? "isolated" : "inherit" }, theme(), { state: {} })), `create_fork [${role}/fast/${mode === "inherit" ? "isolated" : "inherit"}] review-…`);
+    }
+    assert.equal(text(renderer.renderCreateForkCall({ name: "review", role: "execute" }, theme(), { state: {} })), "create_fork [execute/?/inherit] review-…");
+  } finally {
+    await cleanup();
+  }
+});
 
 test("renders pending and completed fork IDs in the call line", async () => {
   const { renderer, cleanup } = await loadRenderer();
@@ -268,6 +288,29 @@ test("renders one expanded task without reentrant invalidation and keeps creatio
       { state, isError: true, invalidate: () => {} },
     );
     assert.equal(text(failure), "Missing configuration.");
+  } finally {
+    await cleanup();
+  }
+});
+
+
+test("renders cancellation outcome in the call and reason only when expanded", async () => {
+  const { renderer, cleanup } = await loadRenderer();
+  try {
+    for (const outcome of ["cancelled", "already_completed"]) {
+      const state: Record<string, unknown> = {};
+      const args = { forkId: "review-1234567", reason: "Scope changed" };
+      const call = renderer.renderCancelForkCall(args, theme(), { state });
+      assert.equal(text(call), "cancel_fork review-1234567");
+      const result = { content: [{ type: "text", text: "Hidden result" }], details: { state: "completed", outcome } };
+      assert.equal(text(renderer.renderCancelForkResult(result, { expanded: false }, theme(), {
+        state, args, invalidate() { throw new Error("must not invalidate while rendering"); },
+      })), "");
+      assert.equal(text(call), `cancel_fork review-1234567: ${outcome}`);
+      assert.equal(text(renderer.renderCancelForkCall(args, theme(), { state, lastComponent: call })), text(call));
+      assert.equal(text(renderer.renderCancelForkResult(result, { expanded: true }, theme(), { state, args })), "─── Reason ───\nScope changed");
+    }
+    assert.equal(text(renderer.renderCancelForkResult({ content: [{ type: "text", text: "Recording failed" }] }, { expanded: false }, theme(), { state: {}, isError: true })), "Recording failed");
   } finally {
     await cleanup();
   }

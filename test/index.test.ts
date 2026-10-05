@@ -6,7 +6,7 @@ import test from "node:test";
 import { Controller } from "../src/forks/controller.js";
 import register from "../src/index.js";
 
-test("registers the three public tools with focused task and effort guidance", () => {
+test("registers the four public tools with focused task and effort guidance", () => {
   const tools: any[] = [];
   const events = new Map<string, Function>();
   const messageRenderers = new Map<string, Function>();
@@ -15,7 +15,7 @@ test("registers the three public tools with focused task and effort guidance", (
     registerTool(tool: unknown) { tools.push(tool); },
     registerMessageRenderer(type: string, renderer: Function) { messageRenderers.set(type, renderer); },
   });
-  assert.deepEqual(tools.map((tool) => tool.name), ["create_fork", "steer_fork", "fork_status"]);
+  assert.deepEqual(tools.map((tool) => tool.name), ["create_fork", "steer_fork", "fork_status", "cancel_fork"]);
   assert.match(tools[0].description, /^Create an asynchronous fork for a focused task\. You receive/);
   assert.match(tools[0].description, /terminal notices/);
   assert.doesNotMatch(tools[0].description, /Use it to offload/);
@@ -25,16 +25,15 @@ test("registers the three public tools with focused task and effort guidance", (
   assert.equal(tools[0].parameters.required.includes("description"), true);
   assert.equal(tools[0].parameters.properties.description.type, "string");
   assert.equal(tools[0].parameters.properties.description.description, "Summarize the fork's purpose in 3 to 6 words for the user. Describe the work, not the fork mechanics. Example: \"Trace login session validation\".");
-  assert.match(tools[0].parameters.properties.effort.description, /^Choose the fork's reasoning effort\./);
-  assert.match(tools[0].parameters.properties.effort.description, /primary cognitive job and required reasoning depth/);
-  assert.match(tools[0].parameters.properties.effort.description, /bounded read-only evidence gathering/);
-  assert.match(tools[0].parameters.properties.effort.description, /does not make final judgments, recommendations, diagnoses, approval or gate decisions, or changes/);
-  assert.match(tools[0].parameters.properties.effort.description, /bounded judgment or settled execution/);
-  assert.match(tools[0].parameters.properties.effort.description, /frontier uncertainty or the hardest reasoning/);
-  assert.match(tools[0].parameters.properties.effort.description, /Effort changes reasoning depth, not task scope/);
-  assert.match(tools[0].parameters.properties.effort.description, /If fast evidence needs judgment, use balanced; if it exposes complex uncertainty, use deep/);
-  assert.match(tools[0].parameters.properties.effort.description, /If unsure, use balanced/);
-  assert.match(tools[0].parameters.properties.effort.description, /Deep is expensive and has more reasoning capability than you\. Use it only when that additional capability is necessary for the outcome\.$/);
+  assert.equal(tools[0].parameters.required.includes("role"), true);
+  assert.equal(tools[0].parameters.required.includes("effort"), true);
+  assert.equal(tools[0].parameters.required.includes("context"), false);
+  assert.match(tools[0].parameters.properties.role.description, /investigate.*read-only/);
+  assert.match(tools[0].parameters.properties.role.description, /execute.*authorized bounded outcome/);
+  assert.match(tools[0].parameters.properties.context.description, /verify defaults to isolated/);
+  assert.match(tools[0].parameters.properties.effort.description, /lowest effort that can reliably complete/);
+  assert.match(tools[0].parameters.properties.effort.description, /fully specified implementation/);
+  assert.doesNotMatch(tools[0].parameters.properties.effort.description, /read-only|If unsure|more reasoning capability than you|default/i);
   assert.equal(Object.hasOwn(tools[0].parameters.properties, "wakeOnCompletion"), false);
   assert.equal(Object.hasOwn(tools[0].parameters.properties, "triggerTurn"), false);
   assert.equal(Object.hasOwn(tools[0].parameters.properties, "tier"), false);
@@ -51,6 +50,12 @@ test("registers the three public tools with focused task and effort guidance", (
   assert.equal(typeof tools[1].renderResult, "function");
   assert.equal(typeof tools[2].renderCall, "function");
   assert.equal(typeof tools[2].renderResult, "function");
+  assert.match(tools[3].description, /does not undo/);
+  assert.equal(tools[3].parameters.properties.reason.type, "string");
+  assert.equal(tools[3].parameters.required.includes("reason"), false);
+  assert.match(tools[3].parameters.properties.forkId.description, /complete fork ID/);
+  assert.equal(typeof tools[3].renderCall, "function");
+  assert.equal(typeof tools[3].renderResult, "function");
   assert.ok(events.has("session_start"));
   assert.ok(events.has("session_before_tree"));
   assert.ok(events.has("session_shutdown"));
@@ -58,13 +63,13 @@ test("registers the three public tools with focused task and effort guidance", (
   assert.ok(messageRenderers.has("pi-async-fork-result"));
 });
 
-test("forwards create_fork effort to the controller without a wake choice", async () => {
+test("forwards explicit role, effort and optional context without inference or a wake choice", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-async-fork-index-"));
   const agentDir = join(root, "agent");
   const cwd = join(root, "project");
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const originalCreate = Controller.prototype.create;
-  const received: Array<{ description: unknown; effort: unknown }> = [];
+  const received: Array<{ description: unknown; options: unknown }> = [];
   try {
     await mkdir(agentDir, { recursive: true });
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({
@@ -75,8 +80,8 @@ test("forwards create_fork effort to the controller without a wake choice", asyn
       },
     }));
     process.env.PI_CODING_AGENT_DIR = agentDir;
-    (Controller.prototype.create as any) = async function (_ctx: unknown, _toolCallId: unknown, _name: unknown, _task: unknown, description: unknown, effort: unknown) {
-      received.push({ description, effort });
+    (Controller.prototype.create as any) = async function (_ctx: unknown, _toolCallId: unknown, _name: unknown, _task: unknown, description: unknown, options: unknown) {
+      received.push({ description, options });
       return "research-1234567";
     };
     const tools: any[] = [];
@@ -84,14 +89,14 @@ test("forwards create_fork effort to the controller without a wake choice", asyn
     const create = tools.find((tool) => tool.name === "create_fork");
     for (const effort of ["fast", "balanced", "deep"] as const) {
       const result = await create.execute(
-        "call", { name: "research", task: "Do the task.", description: "Complete the assigned task", effort }, new AbortController().signal, undefined, { cwd, sessionManager: {} },
+        "call", { name: "research", task: "Do the task.", description: "Complete the assigned task", role: "execute", effort, context: "isolated" }, new AbortController().signal, undefined, { cwd, sessionManager: {} },
       );
       assert.equal(result.content[0].text, "research-1234567");
     }
     assert.deepEqual(received, [
-      { description: "Complete the assigned task", effort: "fast" },
-      { description: "Complete the assigned task", effort: "balanced" },
-      { description: "Complete the assigned task", effort: "deep" },
+      { description: "Complete the assigned task", options: { role: "execute", effort: "fast", context: "isolated" } },
+      { description: "Complete the assigned task", options: { role: "execute", effort: "balanced", context: "isolated" } },
+      { description: "Complete the assigned task", options: { role: "execute", effort: "deep", context: "isolated" } },
     ]);
   } finally {
     Controller.prototype.create = originalCreate;
@@ -187,6 +192,7 @@ test("rejects every async-fork tool in a marked child session", async () => {
     ["create_fork", { name: "research", task: "Do the task." }],
     ["steer_fork", { forkId: "research-1234567", message: "Continue." }],
     ["fork_status", { forkId: "research-1234567" }],
+    ["cancel_fork", { forkId: "research-1234567", reason: "Scope changed" }],
   ] as const;
   for (const [name, params] of calls) {
     const tool = tools.find((candidate) => candidate.name === name);
@@ -218,5 +224,40 @@ test("keeps tools available with a clear error when startup configuration is abs
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await rm(isolatedAgentDir, { recursive: true, force: true });
+  }
+});
+
+
+test("forwards cancel_fork identity, reason and signal and exposes its outcome", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-async-fork-index-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const originalCancel = Controller.prototype.cancel;
+  try {
+    await writeFile(join(root, "settings.json"), JSON.stringify({ "pi-async-fork": {
+      fast: { provider: "test", model: "fast", thinking: "low" },
+      balanced: { provider: "test", model: "balanced", thinking: "low" },
+      deep: { provider: "test", model: "deep", thinking: "low" },
+    } }));
+    process.env.PI_CODING_AGENT_DIR = root;
+    const received: any[] = [];
+    Controller.prototype.cancel = async function (ctx, forkId, reason, signal) {
+      received.push({ ctx, forkId, reason, signal });
+      return { state: "completed", outcome: "cancelled" };
+    };
+    const tools: any[] = [];
+    register({ on() {}, registerTool(tool: any) { tools.push(tool); }, registerMessageRenderer() {} });
+    const ctx = { cwd: root, sessionManager: {} };
+    const signal = new AbortController().signal;
+    const result = await tools.find((tool) => tool.name === "cancel_fork").execute(
+      "call", { forkId: "research-1234567", reason: "Scope changed" }, signal, undefined, ctx,
+    );
+    assert.deepEqual(received, [{ ctx, forkId: "research-1234567", reason: "Scope changed", signal }]);
+    assert.deepEqual(result.details, { state: "completed", outcome: "cancelled" });
+    assert.equal(result.content[0].text, "research-1234567: cancelled");
+  } finally {
+    Controller.prototype.cancel = originalCancel;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(root, { recursive: true, force: true });
   }
 });

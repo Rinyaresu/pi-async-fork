@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createChildSession, isForkChildSession, projectInvokingAssistant } from "../../src/forks/session.js";
 
 const zeroUsage = {
@@ -49,6 +50,38 @@ async function entries(path: string): Promise<any[]> {
   return (await readFile(path, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
 }
 
+test("isolated builds a native fresh context with lineage and secure permissions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-async-fork-isolated-"));
+  const sentinel = "PARENT_ONLY_SENTINEL";
+  const invoking = { ...entry, message: { ...entry.message, content: [{ type: "thinking", thinking: sentinel }, ...entry.message.content] } };
+  try {
+    const child = await createChildSession(manager(root, [invoking]), "call-1", "review-1234567", { role: "verify", context: "isolated", cwd: root });
+    const raw = await readFile(child.path, "utf8");
+    const records = await entries(child.path);
+    assert.equal(raw.includes(sentinel), false);
+    assert.equal(records.length, 3);
+    assert.equal(records[0].parentSession, join(root, "parent.jsonl"));
+    assert.equal(records[0].cwd, root);
+    assert.notEqual(records[0].id, "parent");
+    assert.equal(records[1].parentId, null);
+    assert.equal(records[1].data.sessionId, records[0].id);
+    assert.equal(records[2].type, "custom_message");
+    assert.equal(records[2].display, false);
+    assert.equal(records[2].parentId, records[1].id);
+    assert.match(records[2].content, /prior conversation was not supplied/);
+    assert.match(records[2].content, /Read-only independent verification/);
+    assert.equal((await stat(child.path)).mode & 0o777, 0o600);
+    const loaded = SessionManager.open(child.path);
+    assert.equal(isForkChildSession(loaded), true);
+    const context = JSON.stringify(loaded.buildSessionContext().messages);
+    assert.equal(context.includes(sentinel), false);
+    assert.equal(context.includes("review-1234567"), true);
+    await assert.rejects(() => createChildSession(manager(root, [invoking]), "missing", "review-1234567", { role: "verify", context: "isolated", cwd: root }), /current tool call/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("projects text and thinking while removing all unfinished tool calls", () => {
   const projected = projectInvokingAssistant(entry);
   assert.deepEqual(projected?.message.content, [
@@ -72,7 +105,7 @@ test("adds a linked zero-usage assistant boundary after the cleaned invoking ass
   await writeFile(join(root, "parent.jsonl"), "parent\n");
   const user = { type: "message", id: "user", parentId: null, message: { role: "user", content: "Delegate." } };
   try {
-    const child = await createChildSession(manager(root, [user, entry]), "call-1", "research-1234567");
+    const child = await createChildSession(manager(root, [user, entry]), "call-1", "research-1234567", { role: "investigate", context: "inherit", cwd: root });
     const childEntries = await entries(child.path);
     const projected = childEntries.at(-3);
     const marker = childEntries.at(-2);
@@ -104,7 +137,7 @@ test("links the assistant boundary to the parent user when no cleaned content re
   const user = { type: "message", id: "user", parentId: null, message: { role: "user", content: "Delegate." } };
   const toolOnly = { ...entry, message: { ...entry.message, content: [{ type: "toolCall", id: "call-1", name: "create_fork", arguments: {} }] } };
   try {
-    const child = await createChildSession(manager(root, [user, toolOnly]), "call-1", "research-1234567");
+    const child = await createChildSession(manager(root, [user, toolOnly]), "call-1", "research-1234567", { role: "execute", context: "inherit", cwd: root });
     const childEntries = await entries(child.path);
     const marker = childEntries.at(-2);
     const boundary = childEntries.at(-1);
@@ -138,8 +171,8 @@ test("uses a fresh exclusive session filename instead of the public fork ID", as
   const root = await mkdtemp(join(tmpdir(), "pi-async-fork-session-"));
   await writeFile(join(root, "parent.jsonl"), "parent\n");
   try {
-    const first = await createChildSession(manager(root, [entry]), "call-1", "research-1234567");
-    const second = await createChildSession(manager(root, [entry]), "call-1", "research-1234567");
+    const first = await createChildSession(manager(root, [entry]), "call-1", "research-1234567", { role: "investigate", context: "inherit", cwd: root });
+    const second = await createChildSession(manager(root, [entry]), "call-1", "research-1234567", { role: "verify", context: "inherit", cwd: root });
     assert.notEqual(first.path, second.path);
     assert.match(first.path, /async-forks\/[0-9a-f-]+\.jsonl$/);
   } finally {
